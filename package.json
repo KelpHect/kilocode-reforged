@@ -49,7 +49,7 @@
       "@pierre/diffs": "1.1.0-beta.18",
       "opentui-spinner": "0.0.6",
       "@solid-primitives/storage": "4.3.3",
-      "@tailwindcss/vite": "4.1.11",
+      "@tailwindcss/vite": "4.2.4",
       "diff": "8.0.4",
       "dompurify": "3.3.3",
       "drizzle-kit": "1.0.0-beta.19-d95b7a4",
@@ -72,16 +72,16 @@
       "remeda": "2.26.0",
       "shiki": "3.20.0",
       "solid-list": "0.3.0",
-      "tailwindcss": "4.1.11",
+      "tailwindcss": "4.2.4",
       "virtua": "0.42.3",
-      "vite": "7.3.2",
+      "vite": "8.0.11",
       "@solidjs/meta": "0.29.4",
       "@solidjs/router": "0.15.4",
       "@solidjs/start": "https://pkg.pr.new/@solidjs/start@dfb2020",
       "@sentry/solid": "10.36.0",
       "@sentry/vite-plugin": "4.6.0",
       "solid-js": "1.9.12",
-      "vite-plugin-solid": "2.11.10",
+      "vite-plugin-solid": "2.11.12",
       "@lydell/node-pty": "1.2.0-beta.10"
     }
   },
@@ -144,7 +144,8 @@
     "fastify": ">=5.8.3",
     "diff": "8.0.4",
     "dompurify": "3.3.3",
-    "happy-dom": ">=20.8.9"
+    "happy-dom": ">=20.8.9",
+    "rolldown": "1.0.0"
   },
   "patchedDependencies": {
     "@npmcli/agent@4.0.0": "patches/@npmcli%2Fagent@4.0.0.patch",

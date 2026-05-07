@@ -96,16 +96,16 @@
   },
   "devDependencies": {
     "@playwright/test": "1.57.0",
-    "@storybook/addon-a11y": "10.2.10",
-    "@storybook/addon-docs": "10.2.10",
-    "@storybook/addon-themes": "10.2.10",
+    "@storybook/addon-a11y": "10.3.6",
+    "@storybook/addon-docs": "10.3.6",
+    "@storybook/addon-themes": "10.3.6",
     "@tsconfig/node22": "catalog:",
     "@types/bun": "catalog:",
-    "storybook": "10.2.10",
-    "storybook-solidjs-vite": "10.0.9",
+    "storybook": "10.3.6",
+    "storybook-solidjs-vite": "10.0.12",
     "typescript": "catalog:",
-    "vite": "7.3.2",
-    "vite-plugin-solid": "2.11.10"
+    "vite": "8.0.11",
+    "vite-plugin-solid": "2.11.12"
   },
   "scripts": {
     "storybook": "storybook dev -p 6006",

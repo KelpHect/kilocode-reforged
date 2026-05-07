@@ -1,0 +1,79 @@
+{
+  "name": "Kilo Code Reforged",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "NODE_VERSION": "24",
+      "BUN_VERSION": "1.3.13"
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "latest"
+    }
+  },
+  "remoteUser": "node",
+  "updateRemoteUserUID": true,
+  "init": true,
+  "containerEnv": {
+    "BUN_INSTALL": "/usr/local/bun",
+    "DOCKER_HOST": "unix:///var/run/docker-host.sock",
+    "PLAYWRIGHT_BROWSERS_PATH": "/home/node/.cache/ms-playwright",
+    "SHELL": "/bin/bash"
+  },
+  "remoteEnv": {
+    "PATH": "/usr/local/bun/bin:${containerEnv:PATH}"
+  },
+  "mounts": [
+    "source=kilocode-reforged-bun-cache,target=/home/node/.bun/install/cache,type=volume",
+    "source=kilocode-reforged-node-modules,target=${containerWorkspaceFolder}/node_modules,type=volume",
+    "source=kilocode-reforged-playwright,target=/home/node/.cache/ms-playwright,type=volume",
+    "source=/var/run/docker.sock,target=/var/run/docker-host.sock,type=bind"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  "forwardPorts": [
+    3002,
+    6006,
+    6007
+  ],
+  "portsAttributes": {
+    "3002": {
+      "label": "kilo-docs"
+    },
+    "6006": {
+      "label": "storybook"
+    },
+    "6007": {
+      "label": "kilo-vscode storybook"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "oven.bun-vscode",
+        "dbaeumer.vscode-eslint",
+        "EditorConfig.EditorConfig",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "eslint.workingDirectories": [
+          {
+            "mode": "auto"
+          }
+        ],
+        "extensions.ignoreRecommendations": false,
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "typescript.tsdk": "node_modules/typescript/lib",
+        "files.eol": "\n"
+      }
+    }
+  }
+}
