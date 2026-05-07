@@ -6,6 +6,31 @@ This file provides guidance to agents when working with code in this repository.
 
 Kilo Code is an open source AI coding agent platform. It ships as a CLI and editor clients that all build on the same backend. This package (`packages/kilo-vscode/`) is the **VS Code extension**.
 
+## Primary Objective
+
+This package is the main focus of the fork. Optimize the VS Code extension before the CLI/TUI unless the task explicitly targets backend/runtime behavior or the extension needs a CLI/server change to work correctly.
+
+- Prioritize sidebar chat, Agent Manager, autocomplete, settings, history, session switching, and extension ↔ CLI connection reliability.
+- Prefer fixing root causes in shared extension modules over adding local one-off logic inside a component.
+- The extension must remain predictable during long-running sessions, large transcripts, reconnects, session restarts, partial SSE streams, and subagent activity.
+- For changes that cross into `packages/opencode/`, keep shared OpenCode edits minimal and annotated per the root `AGENTS.md`.
+
+## Core Priorities
+
+- Performance first.
+- Reliability first.
+- Keep behavior predictable under load and during failures, including session restarts, reconnects, and partial streams.
+- If a tradeoff is required, choose correctness and robustness over short-term convenience.
+- Optimize for long VS Code extension sessions with large transcripts, many tool parts, streamed SSE updates, subagents, and repeated session switches.
+
+## Maintainability
+
+- Long term maintainability is a core priority.
+- When adding functionality, first check whether shared logic can be extracted to a separate module.
+- Duplicate logic across multiple files is a code smell and should be avoided.
+- Do not take shortcuts by adding local one-off logic just to solve the immediate problem.
+- Do not be afraid to change existing code when that is the clearer, more maintainable path.
+
 ### Products and How They Relate
 
 All products are thin clients over the **CLI** (`packages/opencode/`, published as `@kilocode/cli`). The CLI is a fork of upstream [OpenCode](https://github.com/anomalyco/opencode) with Kilo-specific additions (gateway auth, telemetry, migration, code review, branding). It contains the full AI agent runtime, tool execution, session management, provider integrations (500+ models), and an HTTP API server.
@@ -126,6 +151,36 @@ Two separate esbuild builds in [`esbuild.js`](esbuild.js):
 - For editor panels, use [`AgentManagerProvider`](src/agent-manager/AgentManagerProvider.ts) pattern with `retainContextWhenHidden: true`
 - esbuild webview build includes [`cssPackageResolvePlugin`](esbuild.js:29) for CSS `@import` resolution and font loaders (`.woff`, `.woff2`, `.ttf`)
 - Avoid `setTimeout` for sequencing VS Code operations — use deterministic event-based waits (e.g. `waitForWebviewPanelToBeActive()`)
+
+## Performance and Reliability
+
+Long transcript performance is a core product requirement. Treat the chat UI as a streaming, high-volume interface: hundreds of messages, thousands of parts, large diffs, many permission rules, and frequent session switches should stay responsive.
+
+### Chat Performance Hotspots
+
+When working near these files, actively look for memory growth, unnecessary reactive subscriptions, repeated full-list scans, and DOM kept alive off-screen:
+
+- `webview-ui/src/context/session.tsx` — message and part storage, SSE handlers, `PartStash`, session switching, cloud imports, scoped permission/question lookups, cost/context derived state.
+- `webview-ui/src/context/session-queue.ts` — message-to-turn grouping and turn identity stability.
+- `webview-ui/src/components/chat/MessageList.tsx` — outer chat virtualization, scroll restore, prepend loading, auto-scroll.
+- `webview-ui/src/components/chat/AssistantMessage.tsx` — assistant part rendering, tool cards, inline questions/suggestions.
+- `webview-ui/src/components/chat/VscodeSessionTurn.tsx` — turn rendering, part hydration, diff summary rendering.
+- `webview-ui/src/components/chat/PermissionDock.tsx` and `QuestionDock.tsx` — potentially large rule/option lists.
+- `webview-ui/src/components/chat/TaskTimeline.tsx` — timeline aggregation over messages and parts.
+
+### Required Practices
+
+- Do not hydrate every message part into Solid's reactive store just because it arrived from history. Keep off-screen parts outside reactive state until a rendered turn needs them, and clean both the reactive store and stash on every message/session removal path.
+- Avoid O(n) or deep object work on every SSE part delta. Streaming updates should touch the smallest possible message, part, turn, and derived state.
+- Keep virtualized list item identity stable across prepends, session switches, and streaming updates.
+- For variable-height chat rows, do not rely on a fixed height guess as the long-term design. If replacing `virtua`, prefer a proven variable-size virtualizer such as TanStack Virtual, wrap it behind a small local adapter, and verify prepend, scroll restore, autoscroll, focus, and Agent Manager embedding before removing the old path.
+- Render expensive diff viewers only when the user has expanded that file and the row is visible. Closed or off-screen diffs must not keep syntax-highlighted DOM or parser/highlighter state alive.
+- Avoid rendering every assistant part in a large message if only a subset is visible or expanded. Add inner virtualization, progressive rendering, or collapsed summaries when tool output/code/diff content can be huge.
+- Cache or incrementally maintain session-family relationships used for scoped permissions, questions, suggestions, costs, and labels. Do not repeatedly BFS the whole message/part tree from multiple components in one render cycle.
+- Clean orphaned parts on cloud preview/import and session switching once no current message references those IDs.
+- For long lists inside docks, keep rendering bounded. Use scrolling, chunking, or virtualization for many permission rules or question options.
+- Throttle or schedule scroll work if it becomes measurable. Scroll handlers must not cause synchronous layout thrash during streaming or fast scrolling.
+- Validate performance fixes with long synthetic transcripts or existing stories/tests that exercise many messages, parts, diffs, permissions, and options. A fix that only works on a short happy path is not done.
 
 ## Extension ↔ Webview Feature Pattern
 

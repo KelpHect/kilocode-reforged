@@ -1,311 +1,130 @@
 # AGENTS.md
 
-Kilo CLI is an open source AI coding agent that generates code from natural language, automates tasks, and supports 500+ AI models.
+This is the repo-root `AGENTS.md` for the Kilo Code Reforged workspace. `AGENTS.md` is plain Markdown: a practical README for coding agents that captures the repo-specific context, commands, conventions, and safety rules needed while working here.
+
+This fork exists to improve the **VS Code extension** first: performance, reliability, maintainability, sidebar chat, Agent Manager, autocomplete, settings, session history, and extension ↔ CLI integration.
+
+## Instruction Scope
+
+- This file applies repo-wide unless a closer `AGENTS.md` exists under the path being edited.
+- Before editing in a subdirectory, check for nested `AGENTS.md` files. The closest file wins when instructions conflict.
+- Explicit user instructions in chat override `AGENTS.md`.
+- Keep instructions concrete and current. Remove stale process rules instead of preserving them for history.
+
+## Core Priorities
+
+- Performance first.
+- Reliability first.
+- Keep behavior predictable under load and during failures, including session restarts, reconnects, and partial streams.
+- If a tradeoff is required, choose correctness and robustness over short-term convenience.
+- Optimize for long VS Code extension sessions with large transcripts, many tool parts, streamed SSE updates, subagents, and repeated session switches.
+
+## Maintainability
+
+- Long term maintainability is a core priority.
+- When adding functionality, first check whether shared logic can be extracted to a separate module.
+- Duplicate logic across multiple files is a code smell and should be avoided.
+- Do not take shortcuts by adding local one-off logic just to solve the immediate problem.
+- Do not be afraid to change existing code when that is the clearer, more maintainable path.
+
+## Product Focus
+
+- Default to work in `packages/kilo-vscode/`.
+- Read `packages/kilo-vscode/AGENTS.md` before planning or editing extension code. Its closer instructions are authoritative for extension work.
+- Treat `packages/opencode/` as the backend/runtime dependency for the extension. Change it only when the extension cannot be made correct through extension-side code or the user explicitly asks for CLI/backend work.
+- Do not spend time on JetBrains, docs, website, cloud, generic CLI/TUI behavior, GitHub project management, upstream merge workflow, or release-process chores unless the user explicitly asks.
+- Agent Manager is part of the VS Code extension. It is not a separate product.
+
+## Workspace Shape
+
+This workspace is intentionally kept VS Code-focused. Use sparse checkout to keep only the extension and the packages needed for a fully functional extension build.
+
+- Enable the focused workspace with `bun run workspace:vscode` from the repo root.
+- Restore the full monorepo with `bun run workspace:full` only when broad cross-package work is explicitly needed.
+- Keep the extension and its build/runtime dependencies available: `packages/kilo-vscode/`, `packages/kilo-ui/`, `packages/ui/`, `packages/kilo-i18n/`, `packages/kilo-indexing/`, `packages/kilo-gateway/`, `packages/plugin/`, `packages/sdk/`, `packages/core/`, `packages/opencode/`, `packages/kilo-telemetry/`, and `packages/script/`.
+- Keep `packages/*/package.json` manifests for excluded workspaces so Bun sees the same workspace graph.
+- Do not replace sparse checkout with symlinks or junctions to another clone.
+- Do not remove a package from the focused workspace unless `bun run workspace:vscode`, `bun run --cwd packages/kilo-vscode typecheck`, and the relevant extension build still work.
+
+## General Rules
 
 - ALWAYS USE PARALLEL TOOLS WHEN APPLICABLE.
-- The default branch in this repo is `main`.
-- Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
-- You may be running in a git worktree. All changes must be made in your current working directory — never modify files in the main repo checkout.
+- The default branch is `main`.
+- Prefer automation: execute requested actions without confirmation unless blocked by missing information or safety/irreversibility.
+- Make changes only in the current working directory.
+- Do not revert user changes unless the user explicitly asks.
+- Never run root `bun test`; use package-level tests instead.
 
 ## Build and Dev
 
-- **Dev**: `bun run dev` (runs from root) or `bun run --cwd packages/opencode --conditions=browser src/index.ts`
-- **Dev with params**: `bun dev -- help`
-- **Extension**: `bun run extension` (build + launch VS Code with the extension in dev mode). Pass `--no-build` to skip the build.
-- **Typecheck**: `bun turbo typecheck` (uses `tsgo`, not `tsc`)
-- **Test**: `bun test` from `packages/opencode/` (NOT from root -- root blocks tests)
-- **Single test**: `bun test ./test/tool/tool-define.test.ts` from `packages/opencode/`
-- **CLI build artifact size check**: after `bun run script/build.ts --single --skip-install` in `packages/opencode/`, use `du -h dist/*/*/bin/kilo` (scoped package output lives under `dist/@kilocode/`)
-- **SDK regen**: After changing server endpoints in `packages/opencode/src/server/`, run `./script/generate.ts` from root to regenerate `packages/sdk/js/`
-- **Knip** (unused exports): `bun run knip` from `packages/kilo-vscode/`. CI runs this — all exported types/functions must be imported somewhere. Remove or unexport unused exports before pushing.
-- **Source links**: After adding or changing URLs in `packages/kilo-vscode/`, `packages/kilo-vscode/webview-ui/`, or `packages/opencode/src/`, run `bun run script/extract-source-links.ts` from the repo root and commit the updated `packages/kilo-docs/source-links.md`. CI runs this check — the build fails if the file is stale.
-- **kilocode_change check**: `bun run check-kilocode-change` from `packages/kilo-vscode/`. CI runs this — `kilocode_change` is a marker for upstream merge conflicts and must not appear in `packages/kilo-vscode/` or `packages/kilo-ui/` (these are entirely Kilo Code additions). Remove the markers before pushing.
-- **opencode annotation check**: `bun run script/check-opencode-annotations.ts` from repo root. CI runs this on PRs touching `packages/opencode/` — every Kilo-specific change in shared opencode files must be annotated with `kilocode_change` markers. Exempt paths (no markers needed): `packages/opencode/src/kilocode/`, `packages/opencode/test/kilocode/`, and any path containing `kilocode` in the name.
-- **workflow allowlist**: `bun run script/check-workflows.ts` from repo root. CI runs this as part of the annotations workflow — any `.yml` / `.yaml` file added to or removed from `.github/workflows/` must be reflected in the hardcoded list in `script/check-workflows.ts`. Prevents upstream-merged workflows from silently starting to run in our CI.
-- **Backend/SDK programmatic testing**: see [TESTING.md](./TESTING.md) for spawning the local main-branch backend (`bun dev serve`) and driving it via `curl` — use this instead of `kilo serve` (prod binary) when testing backend fixes.
+- **Launch extension**: `bun run extension` from the repo root, or from `packages/kilo-vscode/`. Pass `--no-build` to skip the build.
+- **Extension typecheck**: `bun run typecheck` from `packages/kilo-vscode/`
+- **Extension lint**: `bun run lint` from `packages/kilo-vscode/`
+- **Extension unit tests**: `bun run test:unit` from `packages/kilo-vscode/`
+- **Extension compile/package**: `bun run compile` or `bun run package` from `packages/kilo-vscode/` when touching build, packaging, SDK, webview integration, or CLI bundling paths.
+- **SDK regen**: after changing server endpoints in `packages/opencode/src/server/`, run `./script/generate.ts` from the repo root to regenerate `packages/sdk/js/`.
+- **Backend testing**: when a backend change is needed for extension behavior, see [TESTING.md](./TESTING.md) for local `bun dev serve` testing.
 
 ## Quality Checks
 
-Before saying an implementation is ready, run the smallest relevant checks that can catch lint, typecheck, and test failures for the touched package. Do not rely on manual extension launch to discover build problems. Fix failures you introduced before the final response, or state exactly which check is still failing or could not be run.
+Before saying an implementation is ready, run the smallest relevant checks that can catch failures in the touched area. Fix failures you introduced, or state exactly what still fails or could not be run.
 
 | Area | Checks |
 |---|---|
-| Root / cross-package | `bun run lint`, `bun run typecheck` |
-| CLI | From `packages/opencode/`: `bun run typecheck`, `bun test` or targeted `bun test ./path/to/file.test.ts` |
-| VS Code extension | From `packages/kilo-vscode/`: `bun run typecheck`, `bun run lint`, `bun run test:unit` or `bun run test` |
-| Extension build/package | From `packages/kilo-vscode/`: `bun run compile` or `bun run package` when touching build, packaging, SDK, or webview integration paths |
-| CI-only guards | Run affected guards documented above, such as `bun run knip`, `bun run check-kilocode-change`, `bun run script/check-opencode-annotations.ts`, or source link extraction |
+| VS Code extension | From `packages/kilo-vscode/`: `bun run typecheck`, `bun run lint`, `bun run test:unit` or targeted tests |
+| Extension build/package | From `packages/kilo-vscode/`: `bun run compile` or `bun run package` |
+| SDK/backend API | `./script/generate.ts`, then extension typecheck/build checks |
+| Root docs/scripts | Targeted script check, such as `bun run script/check-md-table-padding.ts AGENTS.md packages/kilo-vscode/AGENTS.md` |
 
-Never run root `bun test`; the root script prints `do not run tests from root` and exits with code 1. Use package-level tests instead.
+## Architecture Pointers
 
-## Products
+Kilo VS Code Extension (`packages/kilo-vscode/`) is the primary product. It bundles a CLI binary, spawns `kilo serve`, and communicates with it over HTTP + SSE using `@kilocode/sdk`.
 
-All products are clients of the **CLI** (`packages/opencode/`), which contains the AI agent runtime, HTTP server, and session management. Each client spawns or connects to a `kilo serve` process and communicates via HTTP + SSE using `@kilocode/sdk`.
-
-| Product | Package | Description |
-|---|---|---|
-| Kilo CLI | `packages/opencode/` | Core engine. TUI, `kilo run`, `kilo serve`. Fork of upstream OpenCode. |
-| Kilo VS Code Extension | `packages/kilo-vscode/` | VS Code extension. Bundles the CLI binary, spawns `kilo serve` as a child process. Includes the **Agent Manager** — a multi-session orchestration panel with git worktree isolation. |
-
-**Agent Manager** refers to a feature inside `packages/kilo-vscode/` (extension code in `src/agent-manager/`, webview in `webview-ui/agent-manager/`). It is not a standalone product. See the extension's `AGENTS.md` for details.
+| Package | Purpose |
+|---|---|
+| `packages/kilo-vscode/` | Primary extension code, webview UI, Agent Manager, extension services |
+| `packages/opencode/` | CLI backend/runtime used by the extension |
+| `packages/sdk/js/` | Generated TypeScript SDK for the backend API |
+| `packages/kilo-ui/` | SolidJS component library used by the extension webview |
+| `packages/ui/` | Shared UI primitives used by kilo-ui |
+| `packages/kilo-i18n/` | Translation strings |
+| `packages/kilo-gateway/` | Auth/provider routing/API integration |
+| `packages/kilo-telemetry/` | Telemetry used by the CLI/runtime |
+| `packages/plugin/` | Plugin/tool interface definitions |
 
 Extension-specific settings should live in the Kilo extension settings, not default VS Code settings, unless they are intentionally VS Code-wide.
 
-## Package Instructions
-
-- When a task primarily touches `packages/kilo-jetbrains/`, read `packages/kilo-jetbrains/AGENTS.md` before planning or editing.
-- For JetBrains Kotlin/Swing UI work, also apply `packages/kilo-jetbrains/.kilo/skills/jetbrains-ui-style/SKILL.md`.
-
-## Monorepo Structure
-
-Turborepo + Bun workspaces. The packages you'll work with most:
-
-| Package | Name | Purpose |
-|---|---|---|
-| `packages/opencode/` | `@kilocode/cli` | Core CLI -- agents, tools, sessions, server, TUI. This is where most work happens. |
-| `packages/sdk/js/` | `@kilocode/sdk` | Auto-generated TypeScript SDK (client for the server API). Do not edit `src/gen/` by hand. |
-| `packages/kilo-vscode/` | `kilo-code` | VS Code extension with sidebar chat + Agent Manager. See its own `AGENTS.md` for details. |
-| `packages/kilo-gateway/` | `@kilocode/kilo-gateway` | Kilo auth, provider routing, API integration |
-| `packages/kilo-telemetry/` | `@kilocode/kilo-telemetry` | PostHog analytics + OpenTelemetry |
-| `packages/kilo-i18n/` | `@kilocode/kilo-i18n` | Internationalization / translations |
-| `packages/kilo-ui/` | `@kilocode/kilo-ui` | SolidJS component library shared by the extension webview and docs screenshot stories |
-| `packages/util/` | `@opencode-ai/util` | Shared utilities (error, path, retry, slug, etc.) |
-| `packages/plugin/` | `@kilocode/plugin` | Plugin/tool interface definitions |
-
 ## Style Guide
 
-- Keep things in one function unless composable or reusable
-- Avoid unnecessary destructuring. Instead of `const { a, b } = obj`, use `obj.a` and `obj.b` to preserve context
-- Avoid `try`/`catch` where possible
-- Avoid using the `any` type
-- Prefer single word variable names where possible
-- Use Bun APIs when possible, like `Bun.file()`
-- Rely on type inference when possible; avoid explicit type annotations or interfaces unless necessary for exports or clarity
-
-### Avoid let statements
-
-We don't like `let` statements, especially combined with if/else statements.
-Prefer `const`.
-
-Good:
-
-### Naming Enforcement (Read This)
-
-THIS RULE IS MANDATORY FOR AGENT WRITTEN CODE.
-
-- Use single word names by default for new locals, params, and helper functions.
-- Multi-word names are allowed only when a single word would be unclear or ambiguous.
-- Do not introduce new camelCase compounds when a short single-word alternative is clear.
-- Before finishing edits, review touched lines and shorten newly introduced identifiers where possible.
-- Good short names to prefer: `pid`, `cfg`, `err`, `opts`, `dir`, `root`, `child`, `state`, `timeout`.
-- Examples to avoid unless truly required: `inputPID`, `existingClient`, `connectTimeout`, `workerPath`.
-
-```ts
-const foo = condition ? 1 : 2
-```
-
-Bad:
-
-```ts
-let foo
-
-if (condition) foo = 1
-else foo = 2
-```
-
-### Avoid else statements
-
-Prefer early returns or using an `iife` to avoid else statements.
-
-Good:
-
-```ts
-function foo() {
-  if (condition) return 1
-  return 2
-}
-```
-
-Bad:
-
-```ts
-function foo() {
-  if (condition) return 1
-  else return 2
-}
-```
-
-### No empty catch blocks
-
-Never leave a `catch` block empty. An empty `catch` silently swallows errors and hides bugs. If you're tempted to write one, ask yourself:
-
-1. Is the `try`/`catch` even needed? (prefer removing it)
-2. Should the error be handled explicitly? (recover, retry, rethrow)
-3. At minimum, log it so failures are visible
-
-Good:
-
-```ts
-try {
-  await save(data)
-} catch (err) {
-  log.error("save failed", { err })
-}
-```
-
-Bad:
-
-```ts
-try {
-  await save(data)
-} catch {}
-```
-
-### Prefer single word naming
-
-Try your best to find a single word name for your variables, functions, etc.
-Only use multiple words if you cannot.
-
-Good:
-
-```ts
-const foo = 1
-const bar = 2
-const baz = 3
-```
-
-Bad:
-
-```ts
-const fooBar = 1
-const barBaz = 2
-const bazFoo = 3
-```
+- Prefer existing local patterns over new abstractions.
+- Keep edits scoped to the extension goal.
+- Prefer `const` over `let`.
+- Prefer early returns over `else`.
+- Avoid unnecessary destructuring; `obj.value` often preserves context better than `const { value } = obj`.
+- Avoid `any`.
+- Avoid `try`/`catch` unless the error is handled usefully; never leave an empty `catch`.
+- Use Bun APIs when they are a good fit.
+- Rely on type inference unless explicit types improve exports or clarity.
+- Prefer short, clear names. Single-word names are good when they remain readable.
 
 ## Testing
 
-You MUST avoid using `mocks` as much as possible.
-Tests MUST test actual implementation, do not duplicate logic into a test.
+- Avoid mocks when practical.
+- Tests should exercise real implementation behavior, not duplicate the logic under test.
+- For performance work, include or run checks that exercise long transcripts, many parts, large diffs, session switches, reconnects, or streamed updates when relevant.
 
 ## Markdown Tables
 
-Do not pad markdown table cells for column alignment. Use the compact form with single-space-padded content cells and a minimal separator row:
+Do not pad Markdown table cells for visual alignment. Use compact tables:
 
-```
+```md
 | Command | What it runs |
 |---|---|
-| `kilo serve` | The prod CLI on `$PATH`. |
+| `bun run extension` | Builds and launches the extension. |
 ```
 
-Do **not** right-pad cells to line up columns:
+Run this after editing Markdown tables:
 
+```bash
+bun run script/check-md-table-padding.ts --fix AGENTS.md packages/kilo-vscode/AGENTS.md
 ```
-| Command                       | What it runs             |
-| ----------------------------- | ------------------------ |
-| `kilo serve`                  | The prod CLI on `$PATH`. |
-```
-
-Padding makes every content change rewrite the entire table, which blows up diffs on untouched rows. Markdown files are excluded from prettier (see `.prettierignore`) so running the formatter won't re-pad them, and `script/check-md-table-padding.ts` enforces the rule in CI. Run `bun run script/check-md-table-padding.ts --fix` to auto-rewrite padded tables.
-
-## Commit Conventions
-
-[Conventional Commits](https://www.conventionalcommits.org/) with scopes matching packages: `vscode`, `cli`, `agent-manager`, `sdk`, `ui`, `i18n`, `kilo-docs`, `gateway`, `telemetry`, `desktop`. Omit scope when spanning multiple packages.
-
-## Changesets
-
-User-facing changes (features, fixes, breaking changes) require a changeset file for release notes. Run `bunx changeset add` or manually create `.changeset/<slug>.md`. Use `patch` for bug fixes, `minor` for new features, `major` for breaking changes. See `.changeset/README.md` for details.
-
-Changeset descriptions appear directly in release notes and are read by end users. Keep them concise and feature-oriented — describe **what changed from the user's perspective**, not implementation details. Write in imperative mood (e.g. "Support exporting conversations as markdown" not "Add a new export handler that serializes session messages to .md files").
-
-## Pull Requests
-
-PR descriptions should be 2-3 lines covering **what** changed and **why**. Focus on intent and context a reviewer can't get from the diff — skip file-by-file inventories, test result summaries, and anything obvious from the code itself.
-
-## GitHub Issues
-
-- When creating a GitHub issue for the VS Code extension or JetBrains plugin, use the repo's existing issue templates in `.github/ISSUE_TEMPLATE/`. Pick the matching template (`Bug report`, `Feature Request`, or `Question`) instead of opening a blank issue.
-- Do not add platform-specific title prefixes such as `[JetBrains]`, `[Jetbrains]`, `[JB]`, `[VS Code]`, `[VSCode]`, or similar. Use a plain, descriptive title.
-- Always add VS Code extension issues to the GitHub project `VS Code Extension`: https://github.com/orgs/Kilo-Org/projects/25
-- Always add JetBrains plugin issues to the GitHub project `Jetbrains Plugin`: https://github.com/orgs/Kilo-Org/projects/39
-- When using `gh`, prefer `gh issue create --template "..." --project "..."` with the matching project title.
-- If project assignment fails because `gh` is missing the required scope, run `gh auth refresh -s project` and retry.
-
-## Fork Merge Process
-
-Kilo CLI is a fork of [opencode](https://github.com/anomalyco/opencode).
-
-**Very important**: when planning or coding, update shared files with OpenCode as last resort! Everything is shared code from OpenCode, except folders that contain `kilo` in the name or have a parent directory that contains `kilo` in the name. Example of kilo specific folders: `packages/opencode/src/kilocode/` and `packages/kilo-docs/`. Always look for ways to implement your feature or fix in a way that minimizes changes to shared code.
-
-### Minimizing Merge Conflicts
-
-We regularly merge upstream changes from opencode. To minimize merge conflicts and keep the sync process smooth:
-
-1. **Prefer `kilocode` directories** - Place Kilo-specific code in dedicated directories whenever possible:
-   - `packages/opencode/src/kilocode/` - Kilo-specific source code
-   - `packages/opencode/test/kilocode/` - Kilo-specific tests
-   - `packages/kilo-gateway/` - The Kilo Gateway package
-
-2. **Minimize changes to shared files** - When you must modify files that exist in upstream opencode, keep changes as small and isolated as possible.
-
-3. **Use `kilocode_change` markers** - When modifying shared code, mark your changes with `kilocode_change` comments so they can be easily identified during merges.
-   Do not use these markers in files within directories with kilo in the name
-
-4. **Avoid restructuring upstream code** - Don't refactor or reorganize code that comes from opencode unless absolutely necessary.
-
-5. **Mirror new config keys to the cloud schema** - When adding a `kilocode_change` key to `Config.Info` in `packages/opencode/src/config/config.ts`, also add the matching JSON Schema entry in `apps/web/src/app/config.json/extras.ts` in the [cloud repo](https://github.com/Kilo-Org/cloud). See [CLI Config Schema](packages/kilo-docs/pages/contributing/architecture/config-schema.md) for the step-by-step.
-
-The goal is to keep our diff from upstream as small as possible, making regular merges straightforward and reducing the risk of conflicts.
-
-### Git conflict style
-
-`bun install` sets `merge.conflictStyle=zdiff3` repo-locally via `script/setup-git.ts` (wired into `postinstall`). Conflicts include the common ancestor between `|||||||` and `=======`, which is what `script/upstream/` and `mergiraf` rely on for structural resolution and what makes manual resolution on shared opencode files tractable. If you've overridden it in your user config, the repo-local setting takes precedence — don't override it back.
-
-### Kilocode Change Markers
-
-To minimize merge conflicts when syncing with upstream, mark Kilo Code-specific changes in shared code with `kilocode_change` comments.
-
-**Single line:**
-
-```typescript
-const value = 42 // kilocode_change
-```
-
-**Multi-line:**
-
-```typescript
-// kilocode_change start
-const foo = 1
-const bar = 2
-// kilocode_change end
-```
-
-**New files:**
-
-```typescript
-// kilocode_change - new file
-```
-
-<!-- prettier-ignore -->
-**JSX/TSX (inside JSX templates):**
-
-<!-- prettier-ignore -->
-```tsx
-{/* kilocode_change */}
-```
-
-<!-- prettier-ignore -->
-```tsx
-{/* kilocode_change start */}
-<MyComponent />
-{/* kilocode_change end */}
-```
-
-#### When markers are NOT needed
-
-Code in these paths is Kilo Code-specific and does NOT need `kilocode_change` markers:
-
-- `packages/opencode/src/kilocode/` - All files in this directory
-- `packages/opencode/test/kilocode/` - All test files for kilocode
-- Any other path containing `kilocode` in filename or directory name
-
-These paths are entirely Kilo Code additions and won't conflict with upstream.
