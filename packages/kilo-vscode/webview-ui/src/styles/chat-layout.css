@@ -209,6 +209,15 @@
   width: 100%;
 }
 
+[data-component="assistant-message-parts"] {
+  width: 100%;
+  min-width: 0;
+}
+
+[data-component="assistant-message-parts"][data-virtualized] {
+  position: relative;
+}
+
 .vscode-session-turn-diffs {
   width: 100%;
 }

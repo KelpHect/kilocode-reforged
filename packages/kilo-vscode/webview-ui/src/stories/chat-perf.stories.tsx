@@ -25,6 +25,8 @@
  *   - 500-turn fixture: <150MB heap peak, <30MB delta between snapshots
  *   - Sustained 60fps during fast scroll (no frames >16.6ms)
  *   - Streaming SSE replay: no UI freeze >50ms
+ *   - Diff-heavy fixture: collapsed summaries do not mount diff viewers
+ *   - Large-part fixture: assistant messages over 12 parts stay windowed
  */
 
 import { createSignal, type Component } from "solid-js"
@@ -120,6 +122,14 @@ interface GenOptions {
   toolDensity?: number
   /** Likelihood that a turn includes a reasoning block. */
   reasoningDensity?: number
+  /** Likelihood that a user turn includes a diff summary. */
+  diffDensity?: number
+  /** Number of diff files to attach when a turn gets a summary. */
+  diffsPerTurn?: number
+  /** Every N turns, add a large burst of assistant parts to stress inner virtualization. */
+  largePartEvery?: number
+  /** Number of parts in each large assistant burst. */
+  largePartCount?: number
 }
 
 interface Generated {
@@ -131,6 +141,8 @@ function generate(opts: GenOptions): Generated {
   const rand = rng(opts.seed)
   const toolP = opts.toolDensity ?? 0.4
   const reasoningP = opts.reasoningDensity ?? 0.2
+  const diffP = opts.diffDensity ?? 0
+  const diffsPerTurn = opts.diffsPerTurn ?? 3
 
   const messages: Message[] = []
   const parts: Record<string, Part[]> = {}
@@ -143,13 +155,17 @@ function generate(opts: GenOptions): Generated {
     const userID = `perf-user-${i.toString().padStart(5, "0")}`
     const asstID = `perf-asst-${i.toString().padStart(5, "0")}`
 
-    messages.push({
+    const userMessage: Message = {
       id: userID,
       sessionID: SESSION_ID,
       role: "user",
       createdAt: new Date(cursor).toISOString(),
       time: { created: cursor },
-    })
+    }
+    if (rand() < diffP) {
+      userMessage.summary = { diffs: makeDiffs(i, diffsPerTurn) }
+    }
+    messages.push(userMessage)
     parts[userID] = [
       {
         id: `${userID}-text`,
@@ -226,10 +242,63 @@ function generate(opts: GenOptions): Generated {
       void callID
     }
 
+    if (opts.largePartEvery && i % opts.largePartEvery === 0) {
+      const count = opts.largePartCount ?? 24
+      for (let j = 0; j < count; j++) {
+        if (j % 4 === 0) {
+          asstParts.push({
+            id: `${asstID}-burst-tool-${j}`,
+            sessionID: SESSION_ID,
+            messageID: asstID,
+            type: "tool",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: { command: `echo ${j}`, description: `echo ${j}` },
+              output: lorem(rand, 12 + Math.floor(rand() * 28)),
+              title: `echo ${j}`,
+            },
+          } as Part)
+          continue
+        }
+        asstParts.push({
+          id: `${asstID}-burst-text-${j}`,
+          sessionID: SESSION_ID,
+          messageID: asstID,
+          type: "text",
+          text: lorem(rand, 10 + Math.floor(rand() * 25)),
+        })
+      }
+    }
+
     parts[asstID] = asstParts
   }
 
   return { messages, parts }
+}
+
+function makeDiffs(turn: number, count: number) {
+  return Array.from({ length: count }, (_, i) => {
+    const file = `src/perf/turn-${turn.toString().padStart(4, "0")}/file-${i}.ts`
+    return {
+      file,
+      patch: [
+        `diff --git a/${file} b/${file}`,
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        "@@ -1,3 +1,4 @@",
+        ` const turn = ${turn}`,
+        `-export const before${i} = "old-${turn}-${i}"`,
+        `+export const before${i} = "new-${turn}-${i}"`,
+        `+export const added${i} = "extra-${turn}-${i}"`,
+        " console.log(turn)",
+        "",
+      ].join("\n"),
+      additions: 2,
+      deletions: 1,
+      status: "modified" as const,
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +317,10 @@ interface PerfFixtureProps {
   seed: number
   toolDensity?: number
   reasoningDensity?: number
+  diffDensity?: number
+  diffsPerTurn?: number
+  largePartEvery?: number
+  largePartCount?: number
   height?: string
 }
 
@@ -259,6 +332,10 @@ const PerfFixture: Component<PerfFixtureProps> = (props) => {
     seed: props.seed,
     toolDensity: props.toolDensity,
     reasoningDensity: props.reasoningDensity,
+    diffDensity: props.diffDensity,
+    diffsPerTurn: props.diffsPerTurn,
+    largePartEvery: props.largePartEvery,
+    largePartCount: props.largePartCount,
   })
 
   const data = {
@@ -313,6 +390,25 @@ export const Turns1000: Story = {
 export const Turns500ToolHeavy: Story = {
   name: "500 turns — tool-heavy",
   render: () => <PerfFixture turns={500} seed={42} toolDensity={0.85} reasoningDensity={0.4} />,
+}
+
+export const Turns500DiffHeavy: Story = {
+  name: "500 turns — diff-heavy",
+  render: () => <PerfFixture turns={500} seed={42} diffDensity={0.85} diffsPerTurn={3} />,
+}
+
+export const Turns500LargeAssistantParts: Story = {
+  name: "500 turns — large assistant parts",
+  render: () => (
+    <PerfFixture
+      turns={500}
+      seed={42}
+      toolDensity={0.75}
+      reasoningDensity={0.35}
+      largePartEvery={2}
+      largePartCount={24}
+    />
+  ),
 }
 
 // ---------------------------------------------------------------------------

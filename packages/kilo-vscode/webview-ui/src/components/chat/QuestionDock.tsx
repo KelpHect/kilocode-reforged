@@ -4,9 +4,10 @@
  * Uses kilo-ui's DockPrompt component for proper surface styling.
  */
 
-import { For, Show, createMemo, createEffect } from "solid-js"
+import { For, Show, createMemo, createEffect, createSignal } from "solid-js"
 import type { Component } from "solid-js"
 import { createStore } from "solid-js/store"
+import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Button } from "@kilocode/kilo-ui/button"
 import { Icon } from "@kilocode/kilo-ui/icon"
 import { useSession } from "../../context/session"
@@ -19,6 +20,9 @@ import {
   toggleAnswer,
   tr,
 } from "./question-dock-utils"
+
+const OPTION_VIRTUAL_THRESHOLD = 20
+const OPTION_ESTIMATE_SIZE = 54
 
 export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => {
   const session = useSession()
@@ -36,6 +40,7 @@ export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => 
     sending: false,
     collapsed: false,
   })
+  const [optionsEl, setOptionsEl] = createSignal<HTMLElement>()
 
   let root!: HTMLDivElement
   let prevAgent: string | undefined
@@ -54,6 +59,9 @@ export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => 
   const question = createMemo(() => questions()[store.tab])
   const confirm = createMemo(() => !single() && store.tab === questions().length)
   const options = createMemo(() => question()?.options ?? [])
+  const hasCustom = () => question()?.custom !== false
+  const optionCount = () => options().length + (hasCustom() ? 1 : 0)
+  const virtualOptions = () => optionCount() > OPTION_VIRTUAL_THRESHOLD
   const input = createMemo(() => store.custom[store.tab] ?? "")
   const multi = createMemo(() => question()?.multiple === true)
   const customPicked = createMemo(() => {
@@ -190,10 +198,51 @@ export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => 
     pick(opt.label)
   }
 
+  const optionVirtualizer = createVirtualizer<HTMLElement, HTMLElement>({
+    get count() {
+      return virtualOptions() ? optionCount() : 0
+    },
+    getScrollElement: () => optionsEl() ?? null,
+    estimateSize: () => OPTION_ESTIMATE_SIZE,
+    overscan: 6,
+    gap: 4,
+    measureElement: (element) => element?.getBoundingClientRect().height ?? OPTION_ESTIMATE_SIZE,
+    getItemKey: (index) => {
+      const opt = options()[index]
+      return opt ? `${index}:${opt.label}` : `${index}:custom`
+    },
+  })
+
+  const virtualOptionItems = createMemo(() => optionVirtualizer.getVirtualItems())
+
+  const focusOption = (index: number) => {
+    optionVirtualizer.scrollToIndex(index, { align: "auto" })
+    requestAnimationFrame(() => {
+      root
+        ?.querySelector<HTMLButtonElement>(`button[data-slot='question-option'][data-option-index='${index}']:not(:disabled)`)
+        ?.focus({ preventScroll: true })
+    })
+  }
+
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return
     if ((e.target as HTMLElement).tagName === "INPUT") return
     e.preventDefault()
+
+    if (virtualOptions()) {
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : undefined
+      const current = Number(active?.getAttribute("data-option-index") ?? -1)
+      const fallback = e.key === "ArrowDown" ? 0 : optionCount() - 1
+      const next =
+        current < 0
+          ? fallback
+          : e.key === "ArrowDown"
+            ? (current + 1) % optionCount()
+            : (current - 1 + optionCount()) % optionCount()
+      focusOption(next)
+      return
+    }
+
     const el = e.currentTarget as HTMLElement
     const items = Array.from(
       el.querySelectorAll<HTMLButtonElement>("button[data-slot='question-option']:not(:disabled)"),
@@ -290,6 +339,97 @@ export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => 
     })
   })
 
+  const renderOption = (opt: NonNullable<ReturnType<typeof options>>[number], index: number) => {
+    const picked = () => store.answers[store.tab]?.includes(opt.label) ?? false
+    const localized = translateOption(opt)
+    return (
+      <button
+        data-slot="question-option"
+        data-option-index={index}
+        data-picked={picked()}
+        disabled={store.sending}
+        onClick={() => selectOption(index)}
+      >
+        <span data-slot="question-option-check" aria-hidden="true">
+          <span data-slot="question-option-box" data-type={multi() ? "checkbox" : "radio"} data-picked={picked()}>
+            <Show when={multi()} fallback={<span data-slot="question-option-radio-dot" />}>
+              <Icon name="check-small" size="small" />
+            </Show>
+          </span>
+        </span>
+        <span data-slot="question-option-main">
+          <span data-slot="option-label">{localized.label()}</span>
+          <Show when={localized.description()}>
+            <span data-slot="option-description">{localized.description()}</span>
+          </Show>
+        </span>
+      </button>
+    )
+  }
+
+  const renderCustomOption = () => (
+    <>
+      <button
+        data-slot="question-option"
+        data-option-index={options().length}
+        data-custom="true"
+        data-picked={customPicked()}
+        disabled={store.sending}
+        onClick={() => selectOption(options().length)}
+      >
+        <span data-slot="question-option-check" aria-hidden="true">
+          <span data-slot="question-option-box" data-type={multi() ? "checkbox" : "radio"} data-picked={customPicked()}>
+            <Show when={multi()} fallback={<span data-slot="question-option-radio-dot" />}>
+              <Icon name="check-small" size="small" />
+            </Show>
+          </span>
+        </span>
+        <span data-slot="question-option-main">
+          <span data-slot="option-label">{language.t("ui.messagePart.option.typeOwnAnswer")}</span>
+          <Show when={!store.editing}>
+            <span data-slot="option-description" data-placeholder={!input()}>
+              {input() || language.t("ui.question.custom.placeholder")}
+            </span>
+          </Show>
+        </span>
+      </button>
+      <Show when={store.editing}>
+        <form data-slot="custom-input-form" onSubmit={handleCustomSubmit}>
+          <input
+            ref={(el) => {
+              setTimeout(() => {
+                if (!document.hasFocus()) return
+                el.focus()
+              }, 0)
+            }}
+            type="text"
+            data-slot="custom-input"
+            placeholder={language.t("ui.question.custom.placeholder")}
+            value={input()}
+            disabled={store.sending}
+            onInput={(e) => {
+              const inputs = [...store.custom]
+              inputs[store.tab] = e.currentTarget.value
+              setStore("custom", inputs)
+            }}
+          />
+          <Button type="submit" variant="primary" size="small" disabled={store.sending}>
+            {multi() ? language.t("ui.common.add") : language.t("ui.common.submit")}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="small"
+            disabled={store.sending}
+            onClick={() => setStore("editing", false)}
+          >
+            {language.t("ui.common.cancel")}
+          </Button>
+        </form>
+      </Show>
+    </>
+  )
+
   return (
     <div
       ref={root}
@@ -350,101 +490,53 @@ export const QuestionDock: Component<{ request: QuestionRequest }> = (props) => 
             <Show when={multi()} fallback={<div data-slot="question-hint">{language.t("ui.question.singleHint")}</div>}>
               <div data-slot="question-hint">{language.t("ui.question.multiHint")}</div>
             </Show>
-            <div data-slot="question-options" onKeyDown={onKey}>
-              <For each={options()}>
-                {(opt, i) => {
-                  const picked = () => store.answers[store.tab]?.includes(opt.label) ?? false
-                  const localized = translateOption(opt)
-                  return (
-                    <button
-                      data-slot="question-option"
-                      data-picked={picked()}
-                      disabled={store.sending}
-                      onClick={() => selectOption(i())}
-                    >
-                      <span data-slot="question-option-check" aria-hidden="true">
-                        <span
-                          data-slot="question-option-box"
-                          data-type={multi() ? "checkbox" : "radio"}
-                          data-picked={picked()}
-                        >
-                          <Show when={multi()} fallback={<span data-slot="question-option-radio-dot" />}>
-                            <Icon name="check-small" size="small" />
-                          </Show>
-                        </span>
-                      </span>
-                      <span data-slot="question-option-main">
-                        <span data-slot="option-label">{localized.label()}</span>
-                        <Show when={localized.description()}>
-                          <span data-slot="option-description">{localized.description()}</span>
-                        </Show>
-                      </span>
-                    </button>
-                  )
-                }}
-              </For>
-              <Show when={question()?.custom !== false}>
-                <button
-                  data-slot="question-option"
-                  data-custom="true"
-                  data-picked={customPicked()}
-                  disabled={store.sending}
-                  onClick={() => selectOption(options().length)}
+            <div
+              ref={setOptionsEl}
+              data-slot="question-options"
+              data-virtualized={virtualOptions() ? "" : undefined}
+              onKeyDown={onKey}
+            >
+              <Show
+                when={virtualOptions()}
+                fallback={
+                  <>
+                    <For each={options()}>{(opt, i) => renderOption(opt, i())}</For>
+                    <Show when={hasCustom()}>{renderCustomOption()}</Show>
+                  </>
+                }
+              >
+                <div
+                  data-slot="question-options-virtual"
+                  style={{
+                    height: `${optionVirtualizer.getTotalSize()}px`,
+                    position: "relative",
+                    width: "100%",
+                  }}
                 >
-                  <span data-slot="question-option-check" aria-hidden="true">
-                    <span
-                      data-slot="question-option-box"
-                      data-type={multi() ? "checkbox" : "radio"}
-                      data-picked={customPicked()}
-                    >
-                      <Show when={multi()} fallback={<span data-slot="question-option-radio-dot" />}>
-                        <Icon name="check-small" size="small" />
-                      </Show>
-                    </span>
-                  </span>
-                  <span data-slot="question-option-main">
-                    <span data-slot="option-label">{language.t("ui.messagePart.option.typeOwnAnswer")}</span>
-                    <Show when={!store.editing}>
-                      <span data-slot="option-description" data-placeholder={!input()}>
-                        {input() || language.t("ui.question.custom.placeholder")}
-                      </span>
-                    </Show>
-                  </span>
-                </button>
-                <Show when={store.editing}>
-                  <form data-slot="custom-input-form" onSubmit={handleCustomSubmit}>
-                    <input
-                      ref={(el) => {
-                        setTimeout(() => {
-                          if (!document.hasFocus()) return
-                          el.focus()
-                        }, 0)
-                      }}
-                      type="text"
-                      data-slot="custom-input"
-                      placeholder={language.t("ui.question.custom.placeholder")}
-                      value={input()}
-                      disabled={store.sending}
-                      onInput={(e) => {
-                        const inputs = [...store.custom]
-                        inputs[store.tab] = e.currentTarget.value
-                        setStore("custom", inputs)
-                      }}
-                    />
-                    <Button type="submit" variant="primary" size="small" disabled={store.sending}>
-                      {multi() ? language.t("ui.common.add") : language.t("ui.common.submit")}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="small"
-                      disabled={store.sending}
-                      onClick={() => setStore("editing", false)}
-                    >
-                      {language.t("ui.common.cancel")}
-                    </Button>
-                  </form>
-                </Show>
+                  <For each={virtualOptionItems()}>
+                    {(item) => {
+                      const opt = createMemo(() => options()[item.index])
+                      return (
+                        <div
+                          ref={(el) => optionVirtualizer.measureElement(el)}
+                          data-index={item.index}
+                          data-slot="question-option-virtual-row"
+                          style={{
+                            position: "absolute",
+                            top: 0,
+                            left: 0,
+                            width: "100%",
+                            transform: `translateY(${item.start}px)`,
+                          }}
+                        >
+                          <Show when={opt()} fallback={renderCustomOption()}>
+                            {(value) => renderOption(value(), item.index)}
+                          </Show>
+                        </div>
+                      )
+                    }}
+                  </For>
+                </div>
               </Show>
             </div>
           </Show>

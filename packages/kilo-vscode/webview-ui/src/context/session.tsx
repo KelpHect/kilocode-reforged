@@ -369,6 +369,22 @@ export const SessionProvider: ParentComponent = (props) => {
       }),
     )
 
+    // Drop the per-mode model selection and the userSet flag for the removed
+    // agent. Otherwise re-creating an agent with the same name later would
+    // resurrect an obsolete model choice instead of resolving from config.
+    setStore(
+      "modelSelections",
+      produce((selections) => {
+        delete selections[name]
+      }),
+    )
+    setUserSetAgents((prev) => {
+      if (!prev[name]) return prev
+      const next = { ...prev }
+      delete next[name]
+      return next
+    })
+
     vscode.postMessage({ type: "removeMode", name })
   }
 
@@ -1115,6 +1131,18 @@ export const SessionProvider: ParentComponent = (props) => {
       //   finish reasons, edits). Need the deep diff to catch that without
       //   tearing down downstream consumers; reconcile updates fields in
       //   place on matching proxies.
+      // On "replace" we're swapping the entire message list, so any
+      // hiddenErrors entries pointing at message IDs no longer present are
+      // dead weight — they're never read again, but the Set keeps growing
+      // each time the user re-enters a session. Compute the diff against
+      // `current` *before* the setStore overwrites it.
+      if (mode === "replace") {
+        const live = new Set(merged.map((m) => m.id))
+        const dropped: string[] = []
+        for (const m of current) if (!live.has(m.id)) dropped.push(m.id)
+        if (dropped.length > 0) clearHiddenErrors(dropped)
+      }
+
       timed(
         "loadMessages.setStore",
         () => {
@@ -1629,6 +1657,18 @@ export const SessionProvider: ParentComponent = (props) => {
       // Free per-session reactive subscriptions for family/scoped derivations.
       disposeFamilyMemosFor(sessionID)
 
+      // Drop the loaded marker for this session. Without this, a server-
+      // initiated delete leaves the ID in `loaded` forever — a small but
+      // unbounded leak across the webview's lifetime, and one that would
+      // make selectSession() short-circuit with mode:"focus" for an ID the
+      // server has already forgotten.
+      setLoaded((prev) => {
+        if (!prev.has(sessionID)) return prev
+        const next = new Set(prev)
+        next.delete(sessionID)
+        return next
+      })
+
       setStore(
         "sessions",
         produce((sessions) => {
@@ -1664,6 +1704,23 @@ export const SessionProvider: ParentComponent = (props) => {
         "agentSelections",
         produce((selections) => {
           delete selections[sessionID]
+        }),
+      )
+      // Drop any per-session model override and variant selections. The variant
+      // store keys session-scoped entries with a `session/<id>/...` prefix; the
+      // sessionVariantKeys helper enumerates them so we can purge in a single
+      // produce call. Without this both maps retain entries indefinitely after
+      // the source session is gone.
+      setStore(
+        "sessionOverrides",
+        produce((overrides) => {
+          delete overrides[sessionID]
+        }),
+      )
+      setStore(
+        "variantSelections",
+        produce((variants) => {
+          for (const key of sessionVariantKeys(variants, sessionID)) delete variants[key]
         }),
       )
       // Clean up pending questions/errors for the deleted session

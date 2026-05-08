@@ -88,13 +88,9 @@ function sameMessages(a: Message[], b: Message[]) {
 // memos that depend on `turns()` — they see the same reference and skip work.
 export function stableMessageTurns(next: MessageTurn[], prev: MessageTurn[] = []): MessageTurn[] {
   if (prev.length === 0) return next
-  // Length mismatch is the common SSE "new turn appeared" case. Skip the
-  // Map allocation; downstream identity at the array level is going to
-  // change anyway because we return a different-length array.
-  if (prev.length !== next.length) return next
 
   const by = new Map(prev.map((turn) => [turn.user.id, turn]))
-  let changed = false
+  let changed = prev.length !== next.length
   const result = next.map((turn) => {
     const old = by.get(turn.user.id)
     if (!old) {

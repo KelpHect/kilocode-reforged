@@ -10,6 +10,8 @@
  */
 
 import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { createStore, produce } from "solid-js/store"
+import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Button } from "@kilocode/kilo-ui/button"
 import { DockPrompt } from "@kilocode/kilo-ui/dock-prompt"
 import { Icon } from "@kilocode/kilo-ui/icon"
@@ -24,6 +26,8 @@ import { permissionDiffs } from "./permission-diff-utils"
 import type { PermissionRequest } from "../../types/messages"
 
 let rulesExpandedPreference = false
+const RULE_VIRTUAL_THRESHOLD = 50
+const RULE_ESTIMATE_SIZE = 28
 
 export const PermissionDock: Component<{
   request: PermissionRequest
@@ -52,14 +56,36 @@ export const PermissionDock: Component<{
 
   // Pre-populate toggle states from existing config rules so previously
   // approved/denied patterns show their saved state immediately.
+  //
+  // Backed by createStore (not createSignal) so that toggling rule N only
+  // invalidates the subscribers that actually read `decisions[N]`. With a
+  // signal, every rule row reading `decisions()[i]` re-runs on every toggle
+  // — O(n) re-execution per click in a 50+ rule list. The store gives us
+  // fine-grained per-key reactivity for free.
   const saved = config().permission?.[props.request.toolName]
   const loadState = savedRuleStates(rules(), saved)
-  const [decisions, setDecisions] = createSignal<Record<number, RuleDecision>>(loadState)
+  const [decisions, setDecisions] = createStore<Record<number, RuleDecision>>(loadState)
   const [expanded, setExpanded] = createSignal(rulesExpandedPreference)
+  const [rulesEl, setRulesEl] = createSignal<HTMLElement>()
 
   let root!: HTMLDivElement
 
   const hasRules = () => rules().length > 0
+  const virtualRules = () => rules().length > RULE_VIRTUAL_THRESHOLD
+
+  const ruleVirtualizer = createVirtualizer<HTMLElement, HTMLElement>({
+    get count() {
+      return virtualRules() ? rules().length : 0
+    },
+    getScrollElement: () => rulesEl() ?? null,
+    estimateSize: () => RULE_ESTIMATE_SIZE,
+    overscan: 10,
+    gap: 2,
+    measureElement: (element) => element?.getBoundingClientRect().height ?? RULE_ESTIMATE_SIZE,
+    getItemKey: (index) => `${index}:${rules()[index] ?? ""}`,
+  })
+
+  const virtualRuleItems = createMemo(() => ruleVirtualizer.getVirtualItems())
 
   const toggleExpanded = () => {
     const next = !expanded()
@@ -71,7 +97,7 @@ export const PermissionDock: Component<{
     const all = rules()
     const approved: string[] = []
     const denied: string[] = []
-    for (const [i, d] of Object.entries(decisions())) {
+    for (const [i, d] of Object.entries(decisions)) {
       const rule = all[Number(i)]
       if (!rule) continue
       if (d === "approved") approved.push(rule)
@@ -81,13 +107,15 @@ export const PermissionDock: Component<{
   }
 
   const toggleRule = (index: number, decision: RuleDecision) => {
-    const current = decisions()[index]
-    const next = current === decision ? "pending" : decision
-    const updated = { ...decisions(), [index]: next }
-    setDecisions(updated)
+    setDecisions(
+      produce((map) => {
+        const current = map[index] ?? "pending"
+        map[index] = current === decision ? "pending" : decision
+      }),
+    )
   }
 
-  const decision = (index: number): RuleDecision => decisions()[index] ?? "pending"
+  const decision = (index: number): RuleDecision => decisions[index] ?? "pending"
 
   const approveTooltip = (index: number) =>
     decision(index) === "approved"
@@ -181,6 +209,44 @@ export const PermissionDock: Component<{
     onCleanup(() => document.removeEventListener("keydown", onKey, true))
   })
 
+  const renderRule = (rule: string, index: number) => (
+    <div data-slot="permission-rule-row" data-decision={decision(index)}>
+      <div data-slot="permission-rule-actions">
+        <Tooltip value={approveTooltip(index)} placement="top">
+          <button
+            data-slot="permission-rule-toggle"
+            data-variant="approve"
+            data-active={decision(index) === "approved" ? "" : undefined}
+            disabled={props.responding}
+            onClick={() => toggleRule(index, "approved")}
+            aria-label={approveTooltip(index)}
+          >
+            <Icon name="check-small" size="small" />
+          </button>
+        </Tooltip>
+        <Tooltip value={denyTooltip(index)} placement="top">
+          <button
+            data-slot="permission-rule-toggle"
+            data-variant="deny"
+            data-active={decision(index) === "denied" ? "" : undefined}
+            disabled={props.responding}
+            onClick={() => toggleRule(index, "denied")}
+            aria-label={denyTooltip(index)}
+          >
+            <Icon name="close-small" size="small" />
+          </button>
+        </Tooltip>
+      </div>
+      <code data-slot="permission-rule">
+        {command()
+          ? label(rule)
+          : rule === "*"
+            ? resolveLabel(props.request.toolName, language.t)
+            : `${resolveLabel(props.request.toolName, language.t)} ${rule}`}
+      </code>
+    </div>
+  )
+
   return (
     <div ref={root} data-component="permission-shortcuts" onKeyDown={onRoot}>
       <DockPrompt
@@ -211,46 +277,46 @@ export const PermissionDock: Component<{
 
               <div data-slot="permission-rules-collapse" data-open={expanded() ? "" : undefined}>
                 <div data-slot="permission-rules-collapse-inner">
-                  <div data-slot="permission-rules">
-                    <For each={rules()}>
-                      {(rule, index) => (
-                        <div data-slot="permission-rule-row" data-decision={decision(index())}>
-                          <div data-slot="permission-rule-actions">
-                            <Tooltip value={approveTooltip(index())} placement="top">
-                              <button
-                                data-slot="permission-rule-toggle"
-                                data-variant="approve"
-                                data-active={decision(index()) === "approved" ? "" : undefined}
-                                disabled={props.responding}
-                                onClick={() => toggleRule(index(), "approved")}
-                                aria-label={approveTooltip(index())}
-                              >
-                                <Icon name="check-small" size="small" />
-                              </button>
-                            </Tooltip>
-                            <Tooltip value={denyTooltip(index())} placement="top">
-                              <button
-                                data-slot="permission-rule-toggle"
-                                data-variant="deny"
-                                data-active={decision(index()) === "denied" ? "" : undefined}
-                                disabled={props.responding}
-                                onClick={() => toggleRule(index(), "denied")}
-                                aria-label={denyTooltip(index())}
-                              >
-                                <Icon name="close-small" size="small" />
-                              </button>
-                            </Tooltip>
-                          </div>
-                          <code data-slot="permission-rule">
-                            {command()
-                              ? label(rule)
-                              : rule === "*"
-                                ? resolveLabel(props.request.toolName, language.t)
-                                : `${resolveLabel(props.request.toolName, language.t)} ${rule}`}
-                          </code>
-                        </div>
-                      )}
-                    </For>
+                  <div ref={setRulesEl} data-slot="permission-rules" data-virtualized={virtualRules() ? "" : undefined}>
+                    <Show
+                      when={virtualRules()}
+                      fallback={<For each={rules()}>{(rule, index) => renderRule(rule, index())}</For>}
+                    >
+                      <div
+                        data-slot="permission-rules-virtual"
+                        style={{
+                          height: `${ruleVirtualizer.getTotalSize()}px`,
+                          position: "relative",
+                          width: "100%",
+                        }}
+                      >
+                        <For each={virtualRuleItems()}>
+                          {(item) => {
+                            const rule = createMemo(() => rules()[item.index])
+                            return (
+                              <Show when={rule()}>
+                                {(value) => (
+                                  <div
+                                    ref={(el) => ruleVirtualizer.measureElement(el)}
+                                    data-index={item.index}
+                                    data-slot="permission-rule-virtual-row"
+                                    style={{
+                                      position: "absolute",
+                                      top: 0,
+                                      left: 0,
+                                      width: "100%",
+                                      transform: `translateY(${item.start}px)`,
+                                    }}
+                                  >
+                                    {renderRule(value(), item.index)}
+                                  </div>
+                                )}
+                              </Show>
+                            )
+                          }}
+                        </For>
+                      </div>
+                    </Show>
                   </div>
                 </div>
               </div>

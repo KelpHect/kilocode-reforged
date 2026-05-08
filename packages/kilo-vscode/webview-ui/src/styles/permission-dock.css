@@ -213,6 +213,12 @@
     }
   }
 
+  [data-slot="permission-rules"][data-virtualized] {
+    display: block;
+    gap: 0;
+    position: relative;
+  }
+
   [data-slot="permission-rules-section"] {
     display: flex;
     flex-direction: column;

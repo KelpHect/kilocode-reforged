@@ -7,8 +7,9 @@
  * Active questions render inline via QuestionDock; permissions are in the bottom dock.
  */
 
-import { Component, For, Show, createMemo } from "solid-js"
+import { Component, For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js"
 import { Dynamic } from "solid-js/web"
+import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Part, PART_MAPPING, ToolRegistry } from "@kilocode/kilo-ui/message-part"
 import type { MessageFeedbackControls } from "@kilocode/kilo-ui/message-part"
 import type {
@@ -24,6 +25,13 @@ import { useConfig } from "../../context/config"
 import { snapshotProgress } from "../../context/session-utils"
 import { QuestionDock } from "./QuestionDock"
 import { SuggestBar } from "./SuggestBar"
+
+const LARGE_PART_THRESHOLD = 12
+const ASSISTANT_PART_ESTIMATE = 80
+const ASSISTANT_PART_OVERSCAN = 3
+
+const isFirefox =
+  typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("firefox")
 
 // Tools that the upstream message-part renderer suppresses (returns null for).
 // We render these ourselves via ToolRegistry when they complete,
@@ -119,6 +127,8 @@ export const AssistantMessage: Component<AssistantMessageProps> = (props) => {
   const display = useDisplay()
   const { config } = useConfig()
   const open = createMemo(() => config().terminal_command_display !== "collapsed")
+  const [root, setRoot] = createSignal<HTMLElement>()
+  const [scrollMargin, setScrollMargin] = createSignal(0)
 
   const parts = createMemo(() => {
     const stored = data.store.part?.[props.message.id]
@@ -126,78 +136,160 @@ export const AssistantMessage: Component<AssistantMessageProps> = (props) => {
     return (stored as SDKPart[]).filter((part) => isRenderable(part))
   })
 
+  const large = () => parts().length > LARGE_PART_THRESHOLD
+  const scrollElement = () => root()?.closest(".message-list") as HTMLElement | null
+
+  let frame: number | undefined
+  const measureOffset = () => {
+    const el = root()
+    const scroll = scrollElement()
+    if (!el || !scroll) return
+    const rect = el.getBoundingClientRect()
+    const scrollRect = scroll.getBoundingClientRect()
+    setScrollMargin(Math.max(0, rect.top - scrollRect.top + scroll.scrollTop))
+  }
+  const scheduleMeasure = () => {
+    if (frame !== undefined) cancelAnimationFrame(frame)
+    frame = requestAnimationFrame(() => {
+      frame = undefined
+      measureOffset()
+    })
+  }
+
+  onMount(scheduleMeasure)
+  createEffect(on(() => parts().length, scheduleMeasure))
+  onCleanup(() => {
+    if (frame !== undefined) cancelAnimationFrame(frame)
+  })
+
+  const virtualizer = createVirtualizer<HTMLElement, HTMLElement>({
+    get count() {
+      return large() ? parts().length : 0
+    },
+    getScrollElement: scrollElement,
+    estimateSize: () => ASSISTANT_PART_ESTIMATE,
+    get overscan() {
+      return ASSISTANT_PART_OVERSCAN
+    },
+    get scrollMargin() {
+      return scrollMargin()
+    },
+    measureElement: isFirefox
+      ? undefined
+      : (element) => element?.getBoundingClientRect().height ?? ASSISTANT_PART_ESTIMATE,
+    getItemKey: (index) => parts()[index]?.id ?? index,
+  })
+
+  const virtualItems = createMemo(() => virtualizer.getVirtualItems())
+
+  const renderPart = (part: SDKPart) => {
+    // Upstream PART_MAPPING["tool"] returns null for todowrite/todoread,
+    // so we detect them here and render via ToolRegistry directly.
+    const isUpstreamSuppressed =
+      part.type === "tool" && UPSTREAM_SUPPRESSED_TOOLS.has((part as SDKPart & { tool: string }).tool)
+
+    // Active question tool parts render the interactive QuestionDock inline
+    const activeQuestion = createMemo(() => matchToolRequest(part, "question", session.questions()))
+
+    // Active suggestion tool parts render the interactive SuggestBar inline
+    const activeSuggestion = createMemo(() => matchToolRequest(part, "suggest", session.suggestions()))
+    const bash = createMemo(() => {
+      if (part.type !== "tool") return
+      const tool = part as unknown as ToolPart
+      if (tool.tool !== "bash") return
+      if (tool.state?.status === "error") return
+      return part
+    })
+
+    return (
+      <Show when={isUpstreamSuppressed || activeQuestion() || activeSuggestion() || bash() || PART_MAPPING[part.type]}>
+        <div data-component="tool-part-wrapper" data-part-type={part.type}>
+          <Show
+            when={activeQuestion()}
+            fallback={
+              <Show
+                when={activeSuggestion()}
+                fallback={
+                  <Show
+                    when={bash()}
+                    fallback={
+                      <Show
+                        when={isUpstreamSuppressed}
+                        fallback={
+                          <Part
+                            part={part}
+                            message={props.message as SDKMessage}
+                            showAssistantCopyPartID={props.showAssistantCopyPartID}
+                            reasoningAutoCollapse={display.reasoningAutoCollapse()}
+                            feedback={props.feedback}
+                            animate={
+                              part.type === "tool" &&
+                              ((part as unknown as ToolPart).state?.status === "pending" ||
+                                (part as unknown as ToolPart).state?.status === "running")
+                            }
+                          />
+                        }
+                      >
+                        <TodoToolCard part={part as unknown as ToolPart} />
+                      </Show>
+                    }
+                  >
+                    {(tool) => <BashToolCard part={tool() as unknown as ToolPart} defaultOpen={open()} />}
+                  </Show>
+                }
+              >
+                {(req) => <SuggestBar request={req()} />}
+              </Show>
+            }
+          >
+            {(req) => <QuestionDock request={req()} />}
+          </Show>
+        </div>
+      </Show>
+    )
+  }
+
   return (
-    <>
-      <For each={parts()}>
-        {(part) => {
-          // Upstream PART_MAPPING["tool"] returns null for todowrite/todoread,
-          // so we detect them here and render via ToolRegistry directly.
-          const isUpstreamSuppressed =
-            part.type === "tool" && UPSTREAM_SUPPRESSED_TOOLS.has((part as SDKPart & { tool: string }).tool)
-
-          // Active question tool parts render the interactive QuestionDock inline
-          const activeQuestion = createMemo(() => matchToolRequest(part, "question", session.questions()))
-
-          // Active suggestion tool parts render the interactive SuggestBar inline
-          const activeSuggestion = createMemo(() => matchToolRequest(part, "suggest", session.suggestions()))
-          const bash = createMemo(() => {
-            if (part.type !== "tool") return
-            const tool = part as unknown as ToolPart
-            if (tool.tool !== "bash") return
-            if (tool.state?.status === "error") return
-            return part
-          })
-
-          return (
-            <Show
-              when={isUpstreamSuppressed || activeQuestion() || activeSuggestion() || bash() || PART_MAPPING[part.type]}
-            >
-              <div data-component="tool-part-wrapper" data-part-type={part.type}>
-                <Show
-                  when={activeQuestion()}
-                  fallback={
-                    <Show
-                      when={activeSuggestion()}
-                      fallback={
-                        <Show
-                          when={bash()}
-                          fallback={
-                            <Show
-                              when={isUpstreamSuppressed}
-                              fallback={
-                                <Part
-                                  part={part}
-                                  message={props.message as SDKMessage}
-                                  showAssistantCopyPartID={props.showAssistantCopyPartID}
-                                  reasoningAutoCollapse={display.reasoningAutoCollapse()}
-                                  feedback={props.feedback}
-                                  animate={
-                                    part.type === "tool" &&
-                                    ((part as unknown as ToolPart).state?.status === "pending" ||
-                                      (part as unknown as ToolPart).state?.status === "running")
-                                  }
-                                />
-                              }
-                            >
-                              <TodoToolCard part={part as unknown as ToolPart} />
-                            </Show>
-                          }
-                        >
-                          {(tool) => <BashToolCard part={tool() as unknown as ToolPart} defaultOpen={open()} />}
-                        </Show>
-                      }
+    <div ref={setRoot} data-component="assistant-message-parts" data-virtualized={large() ? "" : undefined}>
+      <Show
+        when={large()}
+        fallback={<For each={parts()}>{(part) => renderPart(part)}</For>}
+      >
+        <div
+          data-slot="assistant-parts-virtual"
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            position: "relative",
+            width: "100%",
+          }}
+        >
+          <For each={virtualItems()}>
+            {(item) => {
+              const part = createMemo(() => parts()[item.index])
+              return (
+                <Show when={part()}>
+                  {(p) => (
+                    <div
+                      ref={(el) => virtualizer.measureElement(el)}
+                      data-index={item.index}
+                      data-slot="assistant-part-virtual-row"
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        transform: `translateY(${item.start - scrollMargin()}px)`,
+                      }}
                     >
-                      {(req) => <SuggestBar request={req()} />}
-                    </Show>
-                  }
-                >
-                  {(req) => <QuestionDock request={req()} />}
+                      {renderPart(p())}
+                    </div>
+                  )}
                 </Show>
-              </div>
-            </Show>
-          )
-        }}
-      </For>
-    </>
+              )
+            }}
+          </For>
+        </div>
+      </Show>
+    </div>
   )
 }

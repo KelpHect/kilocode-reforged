@@ -153,6 +153,12 @@
     }
   }
 
+  [data-slot="question-options"][data-virtualized] {
+    display: block;
+    gap: 0;
+    position: relative;
+  }
+
   [data-slot="question-option"] {
     display: flex;
     align-items: flex-start;
