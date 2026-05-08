@@ -10,6 +10,7 @@
  */
 
 import { type Component, For, Show, createEffect, createMemo, createSignal, on, onCleanup, JSX } from "solid-js"
+import { debounce, leadingAndTrailing, throttle } from "@solid-primitives/scheduled"
 import { Icon } from "@kilocode/kilo-ui/icon"
 import { Spinner } from "@kilocode/kilo-ui/spinner"
 import { useDialog } from "@kilocode/kilo-ui/context/dialog"
@@ -25,7 +26,7 @@ import { AccountSwitcher } from "../shared/AccountSwitcher"
 import { KiloNotifications } from "./KiloNotifications"
 import { WorkingIndicator } from "../shared/WorkingIndicator"
 import { QuestionDock } from "./QuestionDock"
-import { Virtualizer } from "virtua/solid"
+import { MessageVirtualizer } from "./MessageVirtualizer"
 import { SuggestBar } from "./SuggestBar"
 import {
   activeUserMessageID as getActiveUserMessageID,
@@ -88,9 +89,69 @@ export const MessageList: Component<MessageListProps> = (props) => {
   const positions = new Map<string, { top: number; userScrolled: boolean }>()
 
   const boundary = () => session.revert()?.messageID
-  const turns = createMemo((prev: MessageTurn[] | undefined) =>
-    stableMessageTurns(messageTurns(session.messages(), boundary()), prev),
-  )
+
+  // One memo computes the entire turn-derived view (full list, visible/queued
+  // partition, active user ID) instead of the prior 5-memo chain. Each
+  // separate memo allocated a fresh array/Set on every recompute and fanned
+  // out to the next, so a single SSE part change cascaded through 4 O(n)
+  // filters even when the *content* of the partition was unchanged. Here we
+  // compute everything in one pass and short-circuit (return `prev`) when
+  // every relevant input matches the previous tick — Solid then skips
+  // notifying every downstream consumer (virtualizer included). Streaming
+  // text deltas (which never affect the partition) become a no-op past this
+  // memo boundary.
+  interface TurnMeta {
+    all: MessageTurn[]
+    visible: MessageTurn[]
+    queued: MessageTurn[]
+    activeID: string | undefined
+    /** Internal: prior queuedIDs snapshot used for short-circuit comparison. */
+    _queuedIDs: string[]
+  }
+
+  const sameStringArrays = (a: string[], b: string[]): boolean => {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+    return true
+  }
+
+  const turnMeta = createMemo<TurnMeta>((prev) => {
+    const msgs = session.messages()
+    const status = session.statusInfo()
+    const b = boundary()
+
+    const all = stableMessageTurns(messageTurns(msgs, b), prev?.all)
+    const queuedIDsArr = queuedUserMessageIDs(msgs, status)
+    const activeID = getActiveUserMessageID(msgs, status)
+
+    // Short-circuit: if every input that affects the partition matches the
+    // previous result (turn array identity preserved by stableMessageTurns,
+    // queued IDs unchanged, active ID unchanged), reuse the entire prev
+    // object. Reference equality short-circuits all downstream memos.
+    if (
+      prev &&
+      prev.all === all &&
+      prev.activeID === activeID &&
+      sameStringArrays(prev._queuedIDs, queuedIDsArr)
+    ) {
+      return prev
+    }
+
+    const queuedSet = new Set(queuedIDsArr)
+    const visible: MessageTurn[] = []
+    const queued: MessageTurn[] = []
+    for (const turn of all) {
+      if (queuedSet.has(turn.user.id)) queued.push(turn)
+      else visible.push(turn)
+    }
+    return { all, visible, queued, activeID, _queuedIDs: queuedIDsArr }
+  })
+
+  const turns = () => turnMeta().all
+  const visibleTurns = () => turnMeta().visible
+  const queuedTurns = () => turnMeta().queued
+  const activeUserID = () => turnMeta().activeID
+
   const isEmpty = () => turns().length === 0 && !session.loading() && !boundary()
 
   const recent = createMemo(() =>
@@ -98,11 +159,6 @@ export const MessageList: Component<MessageListProps> = (props) => {
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
       .slice(0, 3),
   )
-
-  const activeUserID = createMemo(() => getActiveUserMessageID(session.messages(), session.statusInfo()))
-  const queuedIDs = createMemo(() => new Set(queuedUserMessageIDs(session.messages(), session.statusInfo())))
-  const visibleTurns = createMemo(() => turns().filter((turn) => !queuedIDs().has(turn.user.id)))
-  const queuedTurns = createMemo(() => turns().filter((turn) => queuedIDs().has(turn.user.id)))
 
   const activeUserIndex = createMemo(() => {
     const active = activeUserID()
@@ -122,9 +178,26 @@ export const MessageList: Component<MessageListProps> = (props) => {
     session.loadOlderMessages()
   }
 
+  // Scroll fires faster than the renderer can usefully respond — easily
+  // 100+ events/sec on a fast wheel/trackpad. Two distinct schedules:
+  //
+  //   - autoScroll bookkeeping is throttled to ~60fps with leading-and-
+  //     trailing edges. The leading edge keeps the response feeling
+  //     immediate (the user-scrolled flag flips on the first event of a
+  //     gesture, not 16ms later); the trailing edge guarantees we observe
+  //     the final scrollTop when the gesture ends.
+  //   - maybeLoadOlder triggers a network fetch, so we debounce it (no
+  //     leading edge) to coalesce a burst of events into one decision
+  //     once the user pauses near the top.
+  //
+  // @solid-primitives/scheduled clears its internal timer on root dispose,
+  // so we don't need an explicit onCleanup.
+  const throttledAutoScroll = leadingAndTrailing(throttle, () => autoScroll.handleScroll(), 16)
+  const debouncedMaybeLoadOlder = debounce(() => maybeLoadOlder(), 250)
+
   const handleScroll = () => {
-    autoScroll.handleScroll()
-    maybeLoadOlder()
+    throttledAutoScroll()
+    debouncedMaybeLoadOlder()
   }
 
   const setScrollRef = (el: HTMLElement | undefined) => {
@@ -231,12 +304,13 @@ export const MessageList: Component<MessageListProps> = (props) => {
               </button>
             </Show>
             <Show when={scrollEl()}>
-              <Virtualizer
+              <MessageVirtualizer
                 data={visibleTurns()}
                 scrollRef={scrollEl()}
                 shift={session.messageMutation() === "prepend"}
-                overscan={6}
+                overscan={12}
                 itemSize={260}
+                getItemKey={(_, turn) => turn.user.id}
               >
                 {(turn, index) => {
                   const queued = createMemo(() => {
@@ -247,7 +321,7 @@ export const MessageList: Component<MessageListProps> = (props) => {
 
                   return <VscodeSessionTurn turn={turn} queued={queued()} onForkMessage={props.onForkMessage} />
                 }}
-              </Virtualizer>
+              </MessageVirtualizer>
             </Show>
             <Show when={boundary()}>
               <RevertBanner />

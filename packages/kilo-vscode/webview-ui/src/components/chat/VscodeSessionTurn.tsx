@@ -74,11 +74,26 @@ export const VscodeSessionTurn: Component<VscodeSessionTurnProps> = (props) => {
   const emptyParts: SDKPart[] = []
   const emptyDiffs: SnapshotFileDiff[] = []
 
-  createEffect(() => {
-    const turn = props.turn
-    const ids = turn.partial ? turn.assistant.map((m) => m.id) : [turn.user.id, ...turn.assistant.map((m) => m.id)]
-    session.hydrateParts(ids)
-  })
+  // Re-key on the structural identity of the turn rather than its object
+  // reference. After Phase 3.4's stableMessageTurns tweak, an unchanged turn
+  // still hands back the same reference — but if a new assistant message
+  // streams in (partial turn growth), the array length changes and we need
+  // to hydrate the new ID. Memoizing on a small string lets `on()` skip
+  // re-runs when the trigger value is unchanged (createMemo's default
+  // `===` equality). Cheap to compute relative to the BFS-style work that
+  // hydrateParts skips when nothing's stashed.
+  const hydrateTrigger = createMemo(
+    () => `${props.turn.user.id}:${props.turn.partial ? "p" : "c"}:${props.turn.assistant.length}`,
+  )
+  createEffect(
+    on(hydrateTrigger, () => {
+      const turn = props.turn
+      const ids = turn.partial
+        ? turn.assistant.map((m) => m.id)
+        : [turn.user.id, ...turn.assistant.map((m) => m.id)]
+      session.hydrateParts(ids)
+    }),
+  )
 
   const message = createMemo(() => props.turn.user as SDKMessage & { role: "user" })
 

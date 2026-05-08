@@ -27,21 +27,9 @@ export interface TimelineBar {
   idx: number
 }
 
-function collect(messages: Message[], parts: Record<string, Part[]>): TimelineBar[] {
-  const result: Part[] = []
-
-  for (const msg of messages) {
-    if (msg.role === "user") continue
-    const ps = parts[msg.id]
-    if (!ps) continue
-    for (const p of ps) {
-      if (p.type === "step-start") continue
-      result.push(p)
-    }
-  }
-
-  const sz = sizes(result)
-  return result.map((p, i) => ({
+function buildBars(parts: Part[]): TimelineBar[] {
+  const sz = sizes(parts)
+  return parts.map((p, i) => ({
     bg: color(p),
     tip: label(p),
     width: sz[i]!.width,
@@ -58,17 +46,31 @@ export const TaskTimeline: Component = () => {
   let startScroll = 0
 
   const messages = () => session.messages()
-  const allParts = () => {
+
+  // Walk session messages once and emit the timeline parts in order. This
+  // memo's reactive deps are: the message list itself + per-message
+  // store.parts[m.id]. Solid only invalidates when those *specific* entries
+  // change — text-delta updates within a part don't touch any field this
+  // memo reads, so streaming text never triggers a bar recompute. New tool
+  // parts (which DO show up as new bars) bump the parts array length and
+  // correctly invalidate.
+  const rawParts = createMemo(() => {
     const msgs = messages()
-    const result: Record<string, Part[]> = {}
-    for (const m of msgs) {
-      const p = session.getParts(m.id)
-      if (p.length > 0) result[m.id] = p
+    const result: Part[] = []
+    for (const msg of msgs) {
+      if (msg.role === "user") continue
+      const ps = session.getParts(msg.id)
+      for (const p of ps) {
+        if (p.type === "step-start") continue
+        result.push(p)
+      }
     }
     return result
-  }
+  })
 
-  const bars = createMemo(() => collect(messages(), allParts()))
+  // Visual mapping is its own memo so it only recomputes when the part list
+  // actually changes shape, not on every reactive tick of unrelated state.
+  const bars = createMemo(() => buildBars(rawParts()))
   const busy = () => session.status() === "busy"
 
   // Auto-scroll to the latest bar when new bars appear

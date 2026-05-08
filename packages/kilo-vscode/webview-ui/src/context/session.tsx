@@ -4,7 +4,17 @@
  * Also owns global (extension-lifetime) model selection (provider context is catalog-only).
  */
 
-import { createContext, useContext, createSignal, createMemo, createEffect, onMount, onCleanup, batch } from "solid-js"
+import {
+  createContext,
+  useContext,
+  createSignal,
+  createMemo,
+  createEffect,
+  createRoot,
+  onMount,
+  onCleanup,
+  batch,
+} from "solid-js"
 import type { ParentComponent, Accessor } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useVSCode } from "./vscode"
@@ -48,6 +58,7 @@ import { resolveModelSelection } from "./model-selection"
 import { resolveMessagePrefs } from "./session-preferences"
 import { errorIDs } from "./session-errors"
 import { PartStash } from "./part-stash"
+import { timed } from "../utils/perf"
 import { getVariant, sessionVariantKeys, transferVariants, variantKey } from "./session-variant-store"
 import { KILO_AUTO, parseModelString } from "../../../src/shared/provider-model"
 
@@ -290,6 +301,30 @@ export const SessionProvider: ParentComponent = (props) => {
   // hydrateParts(). This avoids writing parts for off-screen messages into
   // the store, which would trigger expensive DOM work for invisible content.
   const stash = new PartStash()
+
+  // Family / scoped derivation caches. sessionFamily walks the message+parts
+  // graph BFS-style and is read from statusText, PermissionDock, QuestionDock,
+  // and various send/abort handlers. Without memoization the BFS re-runs on
+  // every render touching scopedPermissions/Questions/Suggestions. Each entry
+  // owns a detached Solid root so we can dispose it surgically on session
+  // delete or session switch (see disposeFamilyMemosFor) without leaking
+  // reactive subscriptions to store.messages / store.parts.
+  type DisposableMemo<T> = { memo: () => T; dispose: () => void }
+  const familyMemos = new Map<string, DisposableMemo<Set<string>>>()
+  const scopedPermsMemos = new Map<string, DisposableMemo<PermissionRequest[]>>()
+  const scopedQuestionsMemos = new Map<string, DisposableMemo<QuestionRequest[]>>()
+  const scopedSuggestionsMemos = new Map<string, DisposableMemo<SuggestionRequest[]>>()
+
+  function disposeFamilyMemosFor(sessionID: string) {
+    familyMemos.get(sessionID)?.dispose()
+    familyMemos.delete(sessionID)
+    scopedPermsMemos.get(sessionID)?.dispose()
+    scopedPermsMemos.delete(sessionID)
+    scopedQuestionsMemos.get(sessionID)?.dispose()
+    scopedQuestionsMemos.delete(sessionID)
+    scopedSuggestionsMemos.get(sessionID)?.dispose()
+    scopedSuggestionsMemos.delete(sessionID)
+  }
 
   // Pending permissions
   const [permissions, setPermissions] = createSignal<PermissionRequest[]>([])
@@ -1060,15 +1095,37 @@ export const SessionProvider: ParentComponent = (props) => {
         mode === "prepend" || mode === "reconcile"
           ? mergeMessages(current, messages, mode)
           : withPending(sessionID, messages)
-      // "replace" mode (session switch): assign directly — reconcile's O(n)
-      // diff is unnecessary when the entire list is new, and its reactive
-      // proxy creation for each message object dominated the trace (~900ms).
-      // "prepend" / "reconcile": reconcile to preserve existing proxies.
-      if (mode === "replace") {
-        setStore("messages", sessionID, merged)
-      } else {
-        setStore("messages", sessionID, reconcile(merged, { key: "id" }))
-      }
+      // The three load modes have different invariants — picking the right
+      // store-write strategy matters because `reconcile` walks every message
+      // in deep-diff mode, which dominated session-switch traces (~900ms).
+      //
+      // - "replace" (session switch / cloud import): the entire list is new.
+      //   Direct assign; reconcile would do O(n) work to confirm "everything
+      //   is new", which we already know.
+      // - "prepend" (load earlier): mergeMessages produces incoming items at
+      //   the front (plain objects with fresh IDs) followed by the current
+      //   tail (existing Solid proxies, references preserved by spread). A
+      //   direct assign keeps those tail proxies — Solid recognizes the
+      //   same references and skips re-wrapping. New head items wrap lazily
+      //   on access. stableMessageTurns then reuses existing turn objects
+      //   for the unchanged tail because `old.user === turn.user` still
+      //   holds. No deep diff needed.
+      // - "reconcile" (background tail refresh): incoming server snapshot
+      //   may have rewritten content for existing IDs (completed timestamps,
+      //   finish reasons, edits). Need the deep diff to catch that without
+      //   tearing down downstream consumers; reconcile updates fields in
+      //   place on matching proxies.
+      timed(
+        "loadMessages.setStore",
+        () => {
+          if (mode === "reconcile") {
+            setStore("messages", sessionID, reconcile(merged, { key: "id" }))
+          } else {
+            setStore("messages", sessionID, merged)
+          }
+        },
+        { mode, count: merged.length },
+      )
 
       for (const msg of messages) {
         if (!msg.parts || msg.parts.length === 0) continue
@@ -1164,43 +1221,71 @@ export const SessionProvider: ParentComponent = (props) => {
 
     if (sessionID) patchPage(sessionID, { lastMutation: "update" })
 
-    // If the stash has parts for this message, hydrate them first so the
-    // SSE update merges into the full part list rather than an empty array.
-    const stashed = stash.peek(effectiveMessageID)
-    if (stashed) {
-      stash.remove(effectiveMessageID)
-      setStore("parts", effectiveMessageID, stashed)
-    }
+    timed("handlePartUpdated", () => mergePartUpdate(effectiveMessageID, part, delta), { type: part.type })
+  }
 
-    setStore(
-      "parts",
-      produce((parts) => {
-        if (!parts[effectiveMessageID]) {
-          parts[effectiveMessageID] = []
-        }
-
-        const existingIndex = parts[effectiveMessageID].findIndex((p) => p.id === part.id)
-
-        if (existingIndex >= 0) {
-          // Update existing part
-          const existing = parts[effectiveMessageID][existingIndex]
+  /** Body of handlePartUpdated, extracted so timed() wraps the merge work without nesting. */
+  function mergePartUpdate(effectiveMessageID: string, part: Part, delta?: PartDelta) {
+    // Route the update based on whether the message has been hydrated into
+    // the reactive store. A turn is "hydrated" once its VscodeSessionTurn
+    // mounted and called hydrateParts(), which writes parts under the
+    // message's key in store.parts. While off-screen we keep the parts in
+    // the stash so streaming SSE deltas don't create reactive proxies for
+    // content nobody is rendering. The drain happens in hydrateParts().
+    if (effectiveMessageID in store.parts) {
+      setStore(
+        "parts",
+        produce((parts) => {
+          const list = parts[effectiveMessageID]
+          if (!list) {
+            // Defensive: the key was present at the check above but the value
+            // is missing. Treat as a fresh hydrated list.
+            parts[effectiveMessageID] = [part]
+            return
+          }
+          const idx = list.findIndex((p) => p.id === part.id)
+          if (idx < 0) {
+            list.push(part)
+            return
+          }
+          const existing = list[idx]
           if (
             delta?.type === "text-delta" &&
             delta.textDelta &&
             (existing.type === "text" || existing.type === "reasoning")
           ) {
-            // Append text delta to text or reasoning parts
             ;(existing as { text: string }).text += delta.textDelta
           } else {
-            // Replace entire part
-            parts[effectiveMessageID][existingIndex] = part
+            list[idx] = part
           }
-        } else {
-          // Add new part
-          parts[effectiveMessageID].push(part)
-        }
-      }),
-    )
+        }),
+      )
+      return
+    }
+
+    // Off-screen: merge into the stash in place. PartStash exposes the
+    // backing array via peek(); mutating it updates the stored value
+    // because the stash holds the same reference.
+    const stashed = stash.peek(effectiveMessageID)
+    if (!stashed) {
+      stash.put(effectiveMessageID, [part])
+      return
+    }
+    const idx = stashed.findIndex((p) => p.id === part.id)
+    if (idx < 0) {
+      stashed.push(part)
+      return
+    }
+    const existing = stashed[idx]
+    if (
+      delta?.type === "text-delta" &&
+      delta.textDelta &&
+      (existing.type === "text" || existing.type === "reasoning")
+    ) {
+      ;(existing as { text: string }).text += delta.textDelta
+    } else {
+      stashed[idx] = part
+    }
   }
 
   function handlePartRemoved(sessionID: string | undefined, messageID: string, partID: string) {
@@ -1393,57 +1478,116 @@ export const SessionProvider: ParentComponent = (props) => {
   /**
    * BFS walk over message parts to discover all session IDs in a session's
    * family tree (self + subagents + sub-subagents). Reads directly from the
-   * store so it's reactive — automatically updates when new parts arrive.
+   * store so callers wrapped in createMemo automatically retrack when new
+   * messages or tool parts arrive. The plain function is kept private so
+   * sessionFamily()'s cached memo can wrap it.
    */
-  function sessionFamily(rootID: string): Set<string> {
-    const family = new Set<string>([rootID])
-    const queue = [rootID]
-    while (queue.length > 0) {
-      const sid = queue.pop()!
-      const msgs = store.messages[sid]
-      if (!msgs) continue
-      for (const msg of msgs) {
-        const parts = store.parts[msg.id]
-        if (!parts) continue
-        for (const p of parts) {
-          if (p.type !== "tool") continue
-          // Webview ToolState omits runtime metadata; task parts still carry it from the backend.
-          const child = childID(
-            p as {
-              type: string
-              tool?: string
-              metadata?: { sessionId?: string }
-              state?: { metadata?: { sessionId?: string } }
-            },
-          )
-          if (child && !family.has(child)) {
-            family.add(child)
-            queue.push(child)
+  function computeSessionFamily(rootID: string): Set<string> {
+    return timed(
+      "sessionFamily",
+      () => {
+        const family = new Set<string>([rootID])
+        const queue = [rootID]
+        while (queue.length > 0) {
+          const sid = queue.pop()!
+          const msgs = store.messages[sid]
+          if (!msgs) continue
+          for (const msg of msgs) {
+            const parts = store.parts[msg.id]
+            if (!parts) continue
+            for (const p of parts) {
+              if (p.type !== "tool") continue
+              // Webview ToolState omits runtime metadata; task parts still carry it from the backend.
+              const child = childID(
+                p as {
+                  type: string
+                  tool?: string
+                  metadata?: { sessionId?: string }
+                  state?: { metadata?: { sessionId?: string } }
+                },
+              )
+              if (child && !family.has(child)) {
+                family.add(child)
+                queue.push(child)
+              }
+            }
           }
         }
-      }
-    }
-    return family
+        return family
+      },
+      { rootID },
+    )
+  }
+
+  // Lazy, per-rootID memos for the family BFS and the scoped permission /
+  // question / suggestion derivations. Each memo lives in its own detached
+  // root so consumers don't accidentally dispose them when their component
+  // unmounts, and so disposeFamilyMemosFor() can free them on session delete
+  // or session switch. The memo only re-runs when its tracked reactive reads
+  // (store.messages, store.parts, or the relevant signal) actually change.
+  function getFamilyMemo(rootID: string): () => Set<string> {
+    const cached = familyMemos.get(rootID)
+    if (cached) return cached.memo
+    const created = createRoot((dispose) => {
+      const memo = createMemo(() => computeSessionFamily(rootID))
+      return { memo, dispose }
+    })
+    familyMemos.set(rootID, created)
+    return created.memo
+  }
+
+  function sessionFamily(rootID: string): Set<string> {
+    return getFamilyMemo(rootID)()
   }
 
   /** Return permissions scoped to the given session's family (self + subagents). */
   function scopedPermissions(sessionID: string | undefined): PermissionRequest[] {
     if (!sessionID) return []
-    const family = sessionFamily(sessionID)
-    return permissions().filter((p) => family.has(p.sessionID))
+    const cached = scopedPermsMemos.get(sessionID)
+    if (cached) return cached.memo()
+    const created = createRoot((dispose) => {
+      const family = getFamilyMemo(sessionID)
+      const memo = createMemo(() => {
+        const fam = family()
+        return permissions().filter((p) => fam.has(p.sessionID))
+      })
+      return { memo, dispose }
+    })
+    scopedPermsMemos.set(sessionID, created)
+    return created.memo()
   }
 
   /** Return questions scoped to the given session's family (self + subagents). */
   function scopedQuestions(sessionID: string | undefined): QuestionRequest[] {
     if (!sessionID) return []
-    const family = sessionFamily(sessionID)
-    return questions().filter((q) => family.has(q.sessionID))
+    const cached = scopedQuestionsMemos.get(sessionID)
+    if (cached) return cached.memo()
+    const created = createRoot((dispose) => {
+      const family = getFamilyMemo(sessionID)
+      const memo = createMemo(() => {
+        const fam = family()
+        return questions().filter((q) => fam.has(q.sessionID))
+      })
+      return { memo, dispose }
+    })
+    scopedQuestionsMemos.set(sessionID, created)
+    return created.memo()
   }
 
   function scopedSuggestions(sessionID: string | undefined): SuggestionRequest[] {
     if (!sessionID) return []
-    const family = sessionFamily(sessionID)
-    return suggestions().filter((item) => family.has(item.sessionID))
+    const cached = scopedSuggestionsMemos.get(sessionID)
+    if (cached) return cached.memo()
+    const created = createRoot((dispose) => {
+      const family = getFamilyMemo(sessionID)
+      const memo = createMemo(() => {
+        const fam = family()
+        return suggestions().filter((item) => fam.has(item.sessionID))
+      })
+      return { memo, dispose }
+    })
+    scopedSuggestionsMemos.set(sessionID, created)
+    return created.memo()
   }
 
   function handleTodoUpdated(sessionID: string, items: TodoItem[]) {
@@ -1482,6 +1626,8 @@ export const SessionProvider: ParentComponent = (props) => {
       const msgIds = msgs.map((m) => m.id)
       for (const id of msgIds) stash.remove(id)
       clearHiddenErrors(msgIds)
+      // Free per-session reactive subscriptions for family/scoped derivations.
+      disposeFamilyMemosFor(sessionID)
 
       setStore(
         "sessions",
@@ -2026,6 +2172,45 @@ export const SessionProvider: ParentComponent = (props) => {
     })
   }
 
+  /**
+   * Move a session family's hydrated parts from the reactive store back into
+   * the stash. Used on session switch to release the per-part reactive proxies
+   * the previous session held without throwing away the data — when the user
+   * comes back, the focus→reconcile path's sameReconcileShape() check stays
+   * accurate (we don't touch store.messages), and the next VscodeSessionTurn
+   * to render calls hydrateParts() to drain the stash back into the store.
+   *
+   * We don't dispose the family memos here on purpose: a permission/question
+   * for a subagent of the parked session can still arrive and the scoped
+   * derivations need to remain accurate. The BFS just sees an empty family
+   * (no tool parts in the store) until re-hydration.
+   */
+  function parkSessionParts(sessionID: string) {
+    const family = sessionFamily(sessionID)
+    const toPark: Array<{ msgID: string; parts: Part[] }> = []
+    for (const sid of family) {
+      const msgs = store.messages[sid]
+      if (!msgs) continue
+      for (const msg of msgs) {
+        const list = store.parts[msg.id]
+        if (!list || list.length === 0) continue
+        // Shallow snapshot — Solid's store proxies stay readable after the
+        // entry is deleted, but we want a plain array for the stash to own.
+        toPark.push({ msgID: msg.id, parts: [...list] })
+      }
+    }
+    if (toPark.length === 0) return
+    batch(() => {
+      setStore(
+        "parts",
+        produce((parts) => {
+          for (const { msgID } of toPark) delete parts[msgID]
+        }),
+      )
+    })
+    for (const { msgID, parts } of toPark) stash.put(msgID, parts)
+  }
+
   function selectSession(id: string) {
     if (!server.isConnected()) {
       console.warn("[Kilo New] Cannot select session: not connected")
@@ -2034,6 +2219,13 @@ export const SessionProvider: ParentComponent = (props) => {
     if (id.startsWith("cloud:")) {
       console.warn("[Kilo New] Cannot select cloud preview session via selectSession")
       return
+    }
+    const prevID = currentSessionID()
+    if (prevID && prevID !== id) {
+      // Park the previous session's parts so its reactive subscriptions are
+      // released. Skipped on no-op selects (same id) to avoid a needless
+      // park/hydrate cycle on re-renders that re-call selectSession.
+      parkSessionParts(prevID)
     }
     const ready = loaded().has(id)
     setCurrentSessionID(id)
