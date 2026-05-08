@@ -221,6 +221,7 @@ export function activate(context: vscode.ExtensionContext) {
   )
 
   const diffSourceCatalog = new DiffSourceCatalog(connectionService)
+  context.subscriptions.push(diffSourceCatalog)
   const diffViewerProvider = new DiffViewerProvider(context.extensionUri, connectionService, diffSourceCatalog, {
     sessionIdProvider: () => provider.getCurrentSessionId(),
   })
@@ -350,7 +351,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand(
       "kilo-code.new.showChanges",
-      (arg?: { sessionId?: string; initialSourceId?: string }) => {
+      (arg?: { sessionId?: string; turnId?: string; initialSourceId?: string }) => {
         diffViewerProvider.openFromCommand(arg)
       },
     ),

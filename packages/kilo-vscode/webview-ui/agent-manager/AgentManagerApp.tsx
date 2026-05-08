@@ -1,6 +1,17 @@
 /** @jsxImportSource solid-js */
 
-import { For, Show, createSignal, createMemo, createEffect, on, onMount, onCleanup, type Component } from "solid-js"
+import {
+  For,
+  Show,
+  createSignal,
+  createMemo,
+  createEffect,
+  on,
+  onMount,
+  onCleanup,
+  type Component,
+  type JSX,
+} from "solid-js"
 import type {
   ExtensionMessage,
   AgentManagerRepoInfoMessage,
@@ -65,6 +76,7 @@ import { ServerProvider } from "../src/context/server"
 import { ProviderProvider } from "../src/context/provider"
 import { ConfigProvider } from "../src/context/config"
 import { DisplayProvider } from "../src/context/display"
+import { KiloEmbeddingModelsProvider } from "../src/context/kilo-embedding-models"
 import { NotificationsProvider } from "../src/context/notifications"
 import { FeedbackProvider } from "../src/context/feedback"
 import { SessionProvider, useSession } from "../src/context/session"
@@ -72,7 +84,7 @@ import { WorktreeModeProvider } from "../src/context/worktree-mode"
 import { ChatView } from "../src/components/chat"
 import HistoryView from "../src/components/history/HistoryView"
 import { NewWorktreeDialog } from "./NewWorktreeDialog"
-import { LanguageBridge, DataBridge } from "../src/App"
+import { LanguageBridge, DataBridge, MermaidDownloadBridge } from "../src/App"
 import { useLanguage } from "../src/context/language"
 import { formatRelativeDate } from "../src/utils/date"
 import { nextSelectionAfterDelete, adjacentHint, restoreLocalSessions, reconcileLocalSessions, LOCAL } from "./navigate"
@@ -89,7 +101,7 @@ import { ApplyDialog } from "./ApplyDialog"
 import { groupApplyConflicts } from "./apply-conflicts"
 import type { ReviewComment } from "./review-comments"
 import { CurrentTabsMenu, createCurrentTabItems, focusCurrentTab } from "./CurrentTabsMenu"
-import { BranchSelect } from "./BranchSelect"
+import { BranchSelect } from "../src/components/shared/BranchSelect"
 import { WorktreeItem } from "./WorktreeItem"
 import SectionHeader from "./SectionHeader"
 import { randomColor } from "./section-colors"
@@ -108,9 +120,9 @@ import { ConstrainDragXAxis } from "./constrain-drag-x"
 import { mergeWorktreeDiffs } from "./diff-state"
 import { initialMessage, seedInitialVariant } from "./initial-message"
 import { createMarkdownRender } from "./review-preferences"
+import { setTabWidths } from "./tab-widths"
 import "./agent-manager.css"
 import "./agent-manager-review.css"
-
 const REVIEW_TAB_ID = "review"
 
 interface SetupState {
@@ -582,6 +594,13 @@ const AgentManagerContent: Component = () => {
 
   // Drag-and-drop state for tab reordering
   const [draggingTab, setDraggingTab] = createSignal<string | undefined>()
+
+  const freezeTabs = () => {
+    const bar = document.querySelector(".am-tab-bar")
+    if (bar instanceof HTMLElement && bar.matches(":hover")) setTabWidths(true)
+  }
+
+  const releaseTabs = () => setTabWidths(false)
   // Tab ordering: context key → ordered session ID array (recovered from extension state)
   const [worktreeTabOrder, setWorktreeTabOrder] = createSignal<Record<string, string[]>>({})
   // Sidebar worktree order (persisted to extension state)
@@ -824,6 +843,8 @@ const AgentManagerContent: Component = () => {
 
   /** True when a local session is actively working. */
   const isLocalBusy = (): boolean => isAnySessionBusy(localSessionIDs())
+
+  const isSessionBusy = (id: string): boolean => isAnySessionBusy([id])
 
   /** Worktrees sorted so that grouped items are always adjacent, respecting custom order if set. */
   const sortedWorktrees = createMemo(() => {
@@ -1449,44 +1470,39 @@ const AgentManagerContent: Component = () => {
     }
   })
 
+  const selectedDiffSessionId = () => {
+    const sel = selection()
+    if (sel === LOCAL) return LOCAL
+    if (!sel) return undefined
+
+    const current = session.currentSessionID()
+    if (current) {
+      const item = managedSessions().find((entry) => entry.id === current)
+      if (item?.worktreeId === sel) return current
+    }
+
+    return managedSessions().find((entry) => entry.worktreeId === sel)?.id
+  }
+
+  const currentDiffSessionId = createMemo(selectedDiffSessionId)
+
   // Start/stop diff watch when panel opens/closes, review tab opens, or session changes
   createEffect(() => {
     const panel = diffOpen()
     const review = reviewActive()
-    const sel = selection()
-    const id = session.currentSessionID()
-    if (panel) {
-      if (sel === LOCAL) {
-        // For local tab, diff against unpushed changes using LOCAL sentinel
-        vscode.postMessage({ type: "agentManager.startDiffWatch", sessionId: LOCAL })
-        return
-      } else if (id) {
-        const ms = managedSessions().find((s) => s.id === id)
-        if (ms?.worktreeId) {
-          vscode.postMessage({ type: "agentManager.startDiffWatch", sessionId: id })
-          return
-        }
-      }
-      vscode.postMessage({ type: "agentManager.stopDiffWatch" })
-      return
-    }
-    if (review) {
-      // Review tab is open but no specific session — use local sentinel for local,
-      // or any session in the selected worktree.
-      if (sel === LOCAL) {
-        vscode.postMessage({ type: "agentManager.startDiffWatch", sessionId: LOCAL })
+
+    if (panel || review) {
+      const id = currentDiffSessionId()
+      if (id) {
+        vscode.postMessage({ type: "agentManager.startDiffWatch", sessionId: id })
         return
       }
-      if (sel) {
-        const managed = managedSessions().find((ms) => ms.worktreeId === sel)
-        if (managed) {
-          vscode.postMessage({ type: "agentManager.startDiffWatch", sessionId: managed.id })
-          return
-        }
-      }
       vscode.postMessage({ type: "agentManager.stopDiffWatch" })
+      setDiffLoading(false)
       return
     }
+
+    setDiffLoading(false)
     vscode.postMessage({ type: "agentManager.stopDiffWatch" })
   })
 
@@ -1516,6 +1532,7 @@ const AgentManagerContent: Component = () => {
   // the <Show> unmount triggers heavy FileDiff cleanup but the tab bar
   // and chat view are already visible before that work runs.
   const closeReviewTab = () => {
+    freezeTabs()
     setReviewActive(false)
     setReviewOpenForSelection(false)
   }
@@ -1539,20 +1556,6 @@ const AgentManagerContent: Component = () => {
       if (data[sid]) return data[sid]!
     }
     return []
-  })
-
-  const currentDiffSessionId = createMemo(() => {
-    const sel = selection()
-    if (sel === LOCAL) return LOCAL
-
-    const current = session.currentSessionID()
-    if (current) {
-      const item = managedSessions().find((entry) => entry.id === current)
-      if (sel && item?.worktreeId === sel) return current
-    }
-
-    if (!sel) return undefined
-    return managedSessions().find((entry) => entry.worktreeId === sel)?.id
   })
 
   const diffSessionKey = createMemo(() => {
@@ -1881,6 +1884,7 @@ const AgentManagerContent: Component = () => {
     vscode.postMessage({ ...msg, worktreeId: sel })
   }
   const handleCloseTab = (sessionId: string) => {
+    freezeTabs()
     const pending = isPending(sessionId)
     const isActive = pending ? sessionId === activePendingId() : session.currentSessionID() === sessionId
     if (isActive) {
@@ -1909,6 +1913,7 @@ const AgentManagerContent: Component = () => {
   const handleTabMouseDown = (sessionId: string, e: MouseEvent) => {
     if (e.button === 1) {
       e.preventDefault()
+      e.stopPropagation()
       handleCloseTab(sessionId)
     }
   }
@@ -1937,6 +1942,7 @@ const AgentManagerContent: Component = () => {
     isPendingId: isPending,
     findTab: (id) => tabLookup().get(id),
     postMessage: (msg) => vscode.postMessage(msg as never),
+    onRemove: freezeTabs,
     getSelection: selection,
     LOCAL,
     REVIEW_TAB_ID,
@@ -1967,7 +1973,6 @@ const AgentManagerContent: Component = () => {
       worktreeTabOrder()[key],
     ).map((item) => item.id)
   })
-
   const handleDragStart = (event: DragEvent) => {
     const id = event.draggable?.id
     if (typeof id === "string") setDraggingTab(id)
@@ -2640,55 +2645,62 @@ const AgentManagerContent: Component = () => {
           >
             <DragDropSensors />
             <ConstrainDragYAxis />
-            <div class="am-tab-bar">
+            <div class="am-tab-bar" onPointerLeave={releaseTabs}>
               <div class="am-tab-scroll-area">
                 <div class={`am-tab-fade am-tab-fade-left ${tabScroll.showLeft() ? "am-tab-fade-visible" : ""}`} />
-                <div class="am-tab-list" ref={tabScroll.setRef}>
-                  <SortableProvider ids={tabIds()}>
-                    <For each={tabIds()}>
-                      {(id) =>
-                        renderTab(id, {
-                          terms,
-                          REVIEW_TAB_ID,
-                          tabIds,
-                          kb,
-                          reviewActive,
-                          currentSessionID: () => session.currentSessionID(),
-                          activePendingId,
-                          visibleTabId,
-                          isPending,
-                          tabLookup,
-                          adjacentHint,
-                          activateTerminal: termHandlers.activate,
-                          deactivateTerminal: termHandlers.deactivate,
-                          closeTerminal: termHandlers.closeTerminal,
-                          terminalMiddleClick: termHandlers.middleClick,
-                          closeReview: closeReviewTab,
-                          reviewMiddleClick: handleReviewTabMouseDown,
-                          selectReviewTab: () => setReviewActive(true),
-                          selectSessionTab,
-                          sessionMiddleClick: handleTabMouseDown,
-                          sessionClose: handleCloseTab,
-                          sessionFork: handleForkSession,
-                          reviewLabel: t("session.tab.review"),
-                          reviewTooltip: t("command.review.toggle"),
-                        })
-                      }
-                    </For>
-                  </SortableProvider>
+                <div class="am-tab-list-wrap">
+                  <div
+                    class="am-tab-list"
+                    ref={tabScroll.setRef}
+                    style={{ "--tab-count": `${tabIds().length}` } as JSX.CSSProperties}
+                  >
+                    <SortableProvider ids={tabIds()}>
+                      <For each={tabIds()}>
+                        {(id) =>
+                          renderTab(id, {
+                            terms,
+                            REVIEW_TAB_ID,
+                            tabIds,
+                            kb,
+                            reviewActive,
+                            currentSessionID: () => session.currentSessionID(),
+                            activePendingId,
+                            visibleTabId,
+                            isPending,
+                            isBusy: isSessionBusy,
+                            tabLookup,
+                            adjacentHint,
+                            activateTerminal: termHandlers.activate,
+                            deactivateTerminal: termHandlers.deactivate,
+                            closeTerminal: termHandlers.closeTerminal,
+                            terminalMiddleClick: termHandlers.middleClick,
+                            closeReview: closeReviewTab,
+                            reviewMiddleClick: handleReviewTabMouseDown,
+                            selectReviewTab: () => setReviewActive(true),
+                            selectSessionTab,
+                            sessionMiddleClick: handleTabMouseDown,
+                            sessionClose: handleCloseTab,
+                            sessionFork: handleForkSession,
+                            reviewLabel: t("session.tab.review"),
+                            reviewTooltip: t("command.review.toggle"),
+                          })
+                        }
+                      </For>
+                    </SortableProvider>
+                  </div>
+                  {renderNewTabButton({
+                    contextSelected: () => selection() !== null,
+                    kb,
+                    newSessionLabel: t("agentManager.session.new"),
+                    newTerminalLabel: t("agentManager.terminal.new"),
+                    newSessionMenuLabel: t("agentManager.session.newSession"),
+                    moreOptionsLabel: t("agentManager.tab.newOptions"),
+                    onNewSession: handleAddSession,
+                    onNewTerminal: () => termHandlers.requestNew(),
+                  })}
                 </div>
                 <div class={`am-tab-fade am-tab-fade-right ${tabScroll.showRight() ? "am-tab-fade-visible" : ""}`} />
               </div>
-              {renderNewTabButton({
-                contextSelected: () => selection() !== null,
-                kb,
-                newSessionLabel: t("agentManager.session.new"),
-                newTerminalLabel: t("agentManager.terminal.new"),
-                newSessionMenuLabel: t("agentManager.session.newSession"),
-                moreOptionsLabel: t("agentManager.tab.newOptions"),
-                onNewSession: handleAddSession,
-                onNewTerminal: () => termHandlers.requestNew(),
-              })}
               <div class="am-tab-actions">
                 <CurrentTabsMenu
                   items={tabMenuItems}
@@ -3110,6 +3122,7 @@ export const AgentManagerApp: Component = () => {
     <ThemeProvider defaultTheme="kilo-vscode">
       <DialogProvider>
         <VSCodeProvider>
+          <MermaidDownloadBridge />
           <ServerProvider>
             <LanguageBridge>
               <MarkedProvider>
@@ -3119,19 +3132,21 @@ export const AgentManagerApp: Component = () => {
                       <ProviderProvider>
                         <ConfigProvider>
                           <DisplayProvider>
-                            <NotificationsProvider>
-                              <SessionProvider>
-                                <FeedbackProvider>
-                                  <IndexingProvider>
-                                    <WorktreeModeProvider>
-                                      <DataBridge>
-                                        <AgentManagerContent />
-                                      </DataBridge>
-                                    </WorktreeModeProvider>
-                                  </IndexingProvider>
-                                </FeedbackProvider>
-                              </SessionProvider>
-                            </NotificationsProvider>
+                            <IndexingProvider>
+                              <KiloEmbeddingModelsProvider>
+                                <NotificationsProvider>
+                                  <SessionProvider>
+                                    <FeedbackProvider>
+                                      <WorktreeModeProvider>
+                                        <DataBridge>
+                                          <AgentManagerContent />
+                                        </DataBridge>
+                                      </WorktreeModeProvider>
+                                    </FeedbackProvider>
+                                  </SessionProvider>
+                                </NotificationsProvider>
+                              </KiloEmbeddingModelsProvider>
+                            </IndexingProvider>
                           </DisplayProvider>
                         </ConfigProvider>
                       </ProviderProvider>
