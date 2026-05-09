@@ -37,6 +37,31 @@ import {
 } from "../../context/session-queue"
 import type { QuestionRequest, SuggestionRequest } from "../../types/messages"
 
+/**
+ * Compact placeholder for queued user turns. Queued turns haven't been
+ * dispatched to the assistant yet, so they have no parts beyond the user's
+ * own input. Mounting a full VscodeSessionTurn for each was wasteful — its
+ * AssistantMessage tree (with its inner virtualizer + many reactive memos)
+ * runs even though there's nothing to render. A flat card is enough until
+ * the turn becomes active and gets re-rendered through the virtualizer.
+ */
+const QueuedTurnCard: Component<{ turn: MessageTurn }> = (props) => {
+  const text = createMemo(() => {
+    const parts = props.turn.user.parts ?? []
+    let out = ""
+    for (const p of parts) {
+      if (p.type === "text") out += p.text
+    }
+    return out.trim()
+  })
+  return (
+    <div data-component="queued-turn-card" data-slot="queued-turn-card">
+      <Icon name="clock" size="small" />
+      <span data-slot="queued-turn-card-text">{text()}</span>
+    </div>
+  )
+}
+
 const KiloLogo = (): JSX.Element => {
   const iconsBaseUri = (window as { ICONS_BASE_URI?: string }).ICONS_BASE_URI || ""
   const isLight =
@@ -86,6 +111,10 @@ export const MessageList: Component<MessageListProps> = (props) => {
   })
 
   const [scrollEl, setScrollEl] = createSignal<HTMLElement>()
+  // FIFO-bounded — `positions` previously grew with every visited session for
+  // the lifetime of the webview. Map iteration preserves insertion order, so
+  // we evict the oldest entry once we exceed POSITION_LIMIT.
+  const POSITION_LIMIT = 50
   const positions = new Map<string, { top: number; userScrolled: boolean }>()
 
   const boundary = () => session.revert()?.messageID
@@ -105,6 +134,10 @@ export const MessageList: Component<MessageListProps> = (props) => {
     visible: MessageTurn[]
     queued: MessageTurn[]
     activeID: string | undefined
+    /** Index of activeID inside `visible`. -1 if no active turn or not in visible.
+     *  Computed inline during the partition loop so consumers don't pay a separate
+     *  `findIndex` on every active-id change. */
+    activeIndex: number
     /** Internal: prior queuedIDs snapshot used for short-circuit comparison. */
     _queuedIDs: string[]
   }
@@ -140,11 +173,15 @@ export const MessageList: Component<MessageListProps> = (props) => {
     const queuedSet = new Set(queuedIDsArr)
     const visible: MessageTurn[] = []
     const queued: MessageTurn[] = []
+    let activeIndex = -1
     for (const turn of all) {
       if (queuedSet.has(turn.user.id)) queued.push(turn)
-      else visible.push(turn)
+      else {
+        if (turn.user.id === activeID) activeIndex = visible.length
+        visible.push(turn)
+      }
     }
-    return { all, visible, queued, activeID, _queuedIDs: queuedIDsArr }
+    return { all, visible, queued, activeID, activeIndex, _queuedIDs: queuedIDsArr }
   })
 
   const turns = () => turnMeta().all
@@ -154,22 +191,24 @@ export const MessageList: Component<MessageListProps> = (props) => {
 
   const isEmpty = () => turns().length === 0 && !session.loading() && !boundary()
 
-  const recent = createMemo(() =>
-    [...session.sessions()]
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-      .slice(0, 3),
-  )
+  // session.sessions() is already sorted updatedAt-desc by the SessionProvider;
+  // re-sorting allocated and sorted a 1200-element array on every welcome render.
+  const recent = createMemo(() => session.sessions().slice(0, 3))
 
-  const activeUserIndex = createMemo(() => {
-    const active = activeUserID()
-    if (!active) return -1
-    return visibleTurns().findIndex((turn) => turn.user.id === active)
-  })
+  // Sourced directly from turnMeta's single-pass partition — no separate
+  // findIndex over visibleTurns on every recompute.
+  const activeUserIndex = () => turnMeta().activeIndex
 
   const save = (id: string | undefined) => {
     const el = scrollEl()
     if (!id || !el) return
+    // Re-set bumps insertion order; trim oldest if we exceed the cap.
+    if (positions.has(id)) positions.delete(id)
     positions.set(id, { top: el.scrollTop, userScrolled: autoScroll.userScrolled() })
+    if (positions.size > POSITION_LIMIT) {
+      const first = positions.keys().next().value
+      if (first) positions.delete(first)
+    }
   }
 
   const maybeLoadOlder = () => {
@@ -326,7 +365,12 @@ export const MessageList: Component<MessageListProps> = (props) => {
             <Show when={boundary()}>
               <RevertBanner />
             </Show>
-            <For each={queuedTurns()}>{(turn) => <VscodeSessionTurn turn={turn} queued />}</For>
+            {/* Queued turns haven't run yet — they have no assistant content
+                to render. The full VscodeSessionTurn mount-cost (AssistantMessage
+                tree, virtualizer scaffold, reactive subscriptions) is wasted
+                for every empty queued slot. Render a compact placeholder card
+                instead so a 20-deep queue doesn't drag down session-switch. */}
+            <For each={queuedTurns()}>{(turn) => <QueuedTurnCard turn={turn} />}</For>
             <WorkingIndicator />
             <For each={props.questions?.()}>{(req) => <QuestionDock request={req} />}</For>
             <For each={props.suggestions?.()}>{(req) => <SuggestBar request={req} />}</For>

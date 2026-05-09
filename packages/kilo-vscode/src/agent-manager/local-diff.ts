@@ -26,8 +26,14 @@ const MAX_UNTRACKED_BYTES = 1_000_000
  *  extension host, the same file would spike VS Code's RSS. Over this
  *  threshold we return a summarized entry (empty `before`/`after`/`patch`,
  *  metadata preserved) so the webview can render counts without
- *  materializing the content. */
-export const MAX_DETAIL_BYTES = 20_000_000
+ *  materializing the content.
+ *
+ *  Lowered from 20 MB to 1 MB: at 20 MB a single-file expand would buffer
+ *  ~80 MB across before/after/patch/normalized in the webview heap, easily
+ *  blowing 1 GB on a single click. 1 MB is still large enough to cover any
+ *  hand-edited file; vendored multi-MB blobs fall back to the summary +
+ *  "open in external diff viewer" path. */
+export const MAX_DETAIL_BYTES = 1_000_000
 
 /**
  * Local, Node.js-side replacement for the server's `WorktreeDiff.summary()` and

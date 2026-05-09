@@ -51,7 +51,7 @@ function setup(active = false) {
     executed.push(args)
   }
 
-  registerTerminalActions(context, provider as never, agent as never)
+  registerTerminalActions(context, provider as never, () => agent as never)
 
   return { commands, events, executed, posts, waits }
 }

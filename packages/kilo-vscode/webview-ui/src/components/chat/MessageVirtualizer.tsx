@@ -140,18 +140,16 @@ export function MessageVirtualizer<T>(props: MessageVirtualizerProps<T>): JSX.El
   // shift indices on prepend (assuming the consumer hands us a `data` array
   // that preserves item references across updates, which `stableMessageTurns`
   // already does).
+  //
+  // The previous implementation built a `Map<index, start>` per scroll tick;
+  // since the visible window is small (12-15 items) and items already carry
+  // `.start`, we now read offsets directly off the items array — no Map
+  // allocation per scroll event.
+  const items = createMemo(() => virtualizer.getVirtualItems())
   const window = createMemo(() => {
-    const items = virtualizer.getVirtualItems()
-    if (items.length === 0) {
-      return { start: -1, end: -1, offsets: new Map<number, number>() }
-    }
-    const offsets = new Map<number, number>()
-    for (const item of items) offsets.set(item.index, item.start)
-    return {
-      start: items[0]!.index,
-      end: items[items.length - 1]!.index,
-      offsets,
-    }
+    const list = items()
+    if (list.length === 0) return { start: -1, end: -1 }
+    return { start: list[0]!.index, end: list[list.length - 1]!.index }
   })
 
   const visibleData = createMemo(() => {
@@ -173,7 +171,7 @@ export function MessageVirtualizer<T>(props: MessageVirtualizerProps<T>): JSX.El
           // Absolute index in the underlying data array. Recomputed when the
           // window shifts (scroll) or when items prepend (window.start moves).
           const absoluteIndex = createMemo(() => window().start + indexInWindow())
-          const offset = createMemo(() => window().offsets.get(absoluteIndex()) ?? 0)
+          const offset = createMemo(() => items()[indexInWindow()]?.start ?? 0)
 
           // children is invoked exactly once per row. The consumer's JSX
           // therefore mounts one component per row; reactive prop bindings

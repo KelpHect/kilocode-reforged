@@ -32,8 +32,14 @@ export class TelemetryProxy {
     this.password = password
   }
 
-  setProvider(provider: TelemetryPropertiesProvider) {
+  setProvider(provider: TelemetryPropertiesProvider | undefined) {
     this.provider = provider
+  }
+
+  /** Clear the active provider only if it matches the caller — avoids
+   *  one provider clearing another's registration during multi-provider teardown. */
+  clearProviderIf(provider: TelemetryPropertiesProvider) {
+    if (this.provider === provider) this.provider = undefined
   }
 
   isVSCodeTelemetryEnabled(): boolean {

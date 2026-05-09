@@ -1,0 +1,38 @@
+/**
+ * Motion tokens + reduced-motion safety net.
+ *
+ * Shared timing/easing tokens for entrance animations, hover/active
+ * microinteractions, and collapse/expand transitions across the webview.
+ *
+ * The reduced-motion block is the load-bearing piece: prior to this file,
+ * keyframe animations in welcome.css, notifications.css, permission-dock.css,
+ * task-header.css, etc. all ran unconditionally. Users who request
+ * `prefers-reduced-motion: reduce` (vestibular sensitivity, VS Code's
+ * "Reduce Motion" accessibility setting on macOS, Windows accessibility) now
+ * get all animations collapsed to ~0ms while we keep the *style* changes
+ * (final position, color) so the UI is still legible.
+ *
+ * Animations should opt INTO motion via:
+ *   @media (prefers-reduced-motion: no-preference) { ... }
+ * rather than relying on the global override below — `!important` is heavy
+ * and we'd like to keep its blast radius small.
+ */
+
+:root {
+  --kilo-motion-fast: 120ms;
+  --kilo-motion-base: 180ms;
+  --kilo-motion-slow: 260ms;
+  --kilo-motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --kilo-motion-ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

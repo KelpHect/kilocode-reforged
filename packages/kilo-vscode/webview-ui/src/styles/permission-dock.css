@@ -3,7 +3,6 @@
    ============================================ */
 
 [data-component="dock-prompt"][data-kind="permission"] {
-  animation: permission-slide-in 0.3s ease-out;
   margin: 12px;
   border: 1px solid
     color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 40%, var(--vscode-panel-border, transparent));
@@ -380,6 +379,19 @@
   }
 }
 
+@media (prefers-reduced-motion: no-preference) {
+  [data-component="dock-prompt"][data-kind="permission"] {
+    animation: permission-slide-in var(--kilo-motion-base, 180ms) var(--kilo-motion-ease-out, ease-out);
+  }
+  /* Brief scale-bounce when a rule toggle activates (approve/deny). Sticky
+     data-active means it only fires on the transition INTO the active state,
+     not on every render. */
+  [data-component="dock-prompt"][data-kind="permission"]
+    [data-slot="permission-rule-toggle"][data-active] {
+    animation: permission-rule-toggle-bounce 220ms var(--kilo-motion-ease-spring, ease-out);
+  }
+}
+
 @keyframes permission-slide-in {
   from {
     opacity: 0;
@@ -389,4 +401,10 @@
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+@keyframes permission-rule-toggle-bounce {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.18); }
+  100% { transform: scale(1); }
 }

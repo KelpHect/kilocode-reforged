@@ -129,6 +129,12 @@ export const VscodeSessionTurn: Component<VscodeSessionTurnProps> = (props) => {
     return undefined
   })
 
+  // Single shared computation for the revert affordance — three places used
+  // to read assistantMessages()/revert()/status() independently, multiplying
+  // dependency edges per visible turn.
+  const canRevert = createMemo(() => assistantMessages().length > 0 && !session.revert())
+  const revertDisabled = createMemo(() => canRevert() && session.status() !== "idle")
+
   return (
     <Show when={message()}>
       {(msg) => (
@@ -137,14 +143,8 @@ export const VscodeSessionTurn: Component<VscodeSessionTurnProps> = (props) => {
           <Show when={!props.turn.partial}>
             <div
               class="vscode-session-turn-user"
-              data-revert-disabled={
-                assistantMessages().length > 0 && !session.revert() && session.status() !== "idle" ? "" : undefined
-              }
-              title={
-                assistantMessages().length > 0 && !session.revert() && session.status() !== "idle"
-                  ? language.t("revert.disabled.agentBusy")
-                  : undefined
-              }
+              data-revert-disabled={revertDisabled() ? "" : undefined}
+              title={revertDisabled() ? language.t("revert.disabled.agentBusy") : undefined}
             >
               <UserMessageDisplay
                 message={msg() as unknown as Parameters<typeof UserMessageDisplay>[0]["message"]}
@@ -153,7 +153,7 @@ export const VscodeSessionTurn: Component<VscodeSessionTurnProps> = (props) => {
                 queued={props.queued}
                 onFork={props.onForkMessage ? () => props.onForkMessage?.(msg().sessionID, msg().id) : undefined}
                 onRevert={
-                  assistantMessages().length > 0 && !session.revert()
+                  canRevert()
                     ? () => {
                         if (session.status() !== "idle") return
                         session.revertSession(msg().id)

@@ -39,6 +39,12 @@ function parent(dir: string): string | undefined {
 }
 
 export async function markWorkspace(root: string, log: (msg: string) => void): Promise<void> {
+  // Spotlight markers are macOS-only — early-return on other platforms so we
+  // skip the parent-traversal + per-folder fs.stat fan-out at activation.
+  // markNoIndex itself also guards on darwin, but the stat calls below run
+  // unconditionally and add up on multi-root workspaces / network FS.
+  if (process.platform !== "darwin") return
+
   const ancestor = parent(root)
   if (ancestor) await markNoIndex(ancestor, log)
 

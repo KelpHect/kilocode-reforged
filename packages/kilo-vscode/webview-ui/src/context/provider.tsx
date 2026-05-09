@@ -7,7 +7,7 @@
 import { createContext, useContext, createSignal, createMemo, onCleanup } from "solid-js"
 import type { ParentComponent, Accessor } from "solid-js"
 import { useVSCode } from "./vscode"
-import type { Provider, ProviderModel, ModelSelection, ExtensionMessage, ProviderAuthState } from "../types/messages"
+import type { Provider, ProviderModel, ModelSelection, ProviderAuthState } from "../types/messages"
 import type { ProviderAuthMethod } from "@kilocode/sdk/v2/client"
 import { flattenModels, findModel as _findModel, isModelValid as isValid } from "./provider-utils"
 import { KILO_AUTO } from "../../../src/shared/provider-model"
@@ -50,11 +50,9 @@ export const ProviderProvider: ParentComponent = (props) => {
 
   // Register handler immediately (not in onMount) so we never miss
   // a providersLoaded message that arrives before the DOM mount.
-  const unsubscribe = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "providersLoaded") {
-      return
-    }
-
+  // Uses onMessageFor so high-frequency SSE traffic (partUpdated etc.)
+  // doesn't run this handler at all.
+  const unsubscribe = vscode.onMessageFor("providersLoaded", (message) => {
     setProviders(message.providers)
     setConnected(message.connected)
     setDefaults(message.defaults)
@@ -75,8 +73,7 @@ export const ProviderProvider: ParentComponent = (props) => {
     }
   }, 3000)
 
-  const unsubReady = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "extensionDataReady") return
+  const unsubReady = vscode.onMessageFor("extensionDataReady", () => {
     unsubReady()
     clearTimeout(fallback)
     if (Object.keys(providers()).length === 0) {

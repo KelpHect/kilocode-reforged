@@ -359,6 +359,11 @@ export class AutocompleteServiceManager {
 
   private updateStatusBar() {
     if (!this.statusBar) {
+      // Don't create the status bar item until the user has enabled
+      // auto-trigger. Showing a permanent "loading…" status bar entry to
+      // every user — including those who never opt into inline completions —
+      // pollutes the bottom strip and adds an extra StatusBarItem disposable.
+      if (!this.settings?.enableAutoTrigger) return
       this.initializeStatusBar()
     }
 

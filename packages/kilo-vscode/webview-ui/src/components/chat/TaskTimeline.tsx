@@ -12,7 +12,7 @@
  * updates bindings in place (unlike React). Even 1000+ bars are fine.
  */
 
-import { Component, Index, createMemo, createEffect, on, onCleanup } from "solid-js"
+import { Component, Index, createMemo, createEffect, on, onCleanup, onMount } from "solid-js"
 import { Tooltip } from "@kilocode/kilo-ui/tooltip"
 import { useSession } from "../../context/session"
 import { color, label } from "../../utils/timeline/colors"
@@ -118,11 +118,13 @@ export const TaskTimeline: Component = () => {
     ref.scrollLeft += e.deltaY || e.deltaX
   }
 
-  createEffect(() => {
-    const el = ref
-    if (!el) return
-    el.addEventListener("wheel", onWheel, { passive: false })
-    onCleanup(() => el.removeEventListener("wheel", onWheel))
+  // Bind once at mount — onMount avoids the subtle createEffect pattern where a
+  // future maintainer could accidentally introduce a reactive read inside the
+  // body, which would silently churn add/remove listeners.
+  onMount(() => {
+    if (!ref) return
+    ref.addEventListener("wheel", onWheel, { passive: false })
+    onCleanup(() => ref?.removeEventListener("wheel", onWheel))
   })
 
   return (

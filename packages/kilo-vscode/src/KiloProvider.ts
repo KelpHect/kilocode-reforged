@@ -79,15 +79,29 @@ import * as McpOAuth from "./kilo-provider/mcp-oauth"
 import { retryable, backoff, MAX_RETRIES } from "./util/retry"
 import { hasGit } from "./kilo-provider/git-status"
 // legacy-migration start
-import {
-  checkAndShowMigrationWizard,
-  handleRequestLegacyMigrationData,
-  handleStartLegacyMigration,
-  handleFinalizeLegacyMigration,
-  handleSkipLegacyMigration,
-  handleClearLegacyData,
-  type MigrationContext,
-} from "./kilo-provider/handlers/migration"
+//
+// The migration handler module pulls in `provider-mapping`, `native-mode-defaults`,
+// the entire `sessions/lib/parts` parsing graph, and `sessions/migrate` — totalling
+// hundreds of KB of code that's only relevant the first time a v5.x user upgrades.
+// We keep only the type as a static import and lazy-load the handlers on demand
+// (see `getMigrationModule()` below). After the migration status is set, the module
+// never loads again for the lifetime of that VS Code install.
+import type { MigrationContext } from "./kilo-provider/handlers/migration"
+// Inline migration-status read to avoid pulling MigrationService at activation.
+// Must stay in sync with `MIGRATION_STATUS_KEY` in `legacy-migration/migration-service.ts`.
+const LEGACY_MIGRATION_STATUS_KEY = "kilo.legacyMigrationStatus"
+type LegacyMigrationStatus = "completed" | "completed_with_errors" | "skipped"
+function getLegacyMigrationStatus(ctx: vscode.ExtensionContext | undefined): LegacyMigrationStatus | undefined {
+  return ctx?.globalState.get<LegacyMigrationStatus>(LEGACY_MIGRATION_STATUS_KEY)
+}
+type MigrationModule = typeof import("./kilo-provider/handlers/migration")
+let migrationModuleCache: MigrationModule | undefined
+function getMigrationModule(): MigrationModule {
+  if (!migrationModuleCache) {
+    migrationModuleCache = require("./kilo-provider/handlers/migration") as MigrationModule
+  }
+  return migrationModuleCache
+}
 // legacy-migration end
 import {
   handleLogin,
@@ -258,6 +272,9 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
   private diffVirtualProvider: import("./DiffVirtualProvider").DiffVirtualProvider | undefined
   private remoteService: RemoteStatusService | null = null
   private unsubscribeRemote: (() => void) | null = null
+  /** Singleton output channel for config warnings — recreated on every "Show Details"
+   *  click would leak undisposed channels. */
+  private configWarningsChannel: vscode.OutputChannel | null = null
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -422,8 +439,13 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     //   "sse-connected"            — SSE connected after webview was ready
     //   "initializeConnection"     — sidebar path where connect() resolves before
     //                                onStateChange is subscribed, so sse-connected never fires
-    if (this.connectionState === "connected") {
-      void checkAndShowMigrationWizard(this.migrationCtx)
+    //
+    // Skip the module load entirely if migration has already run — for users
+    // upgrading from a previous Kilo Code release this is the common case, and
+    // the migration module pulls in hundreds of KB of legacy parsers we'd
+    // otherwise carry on every reconnect of the SSE stream.
+    if (this.connectionState === "connected" && getLegacyMigrationStatus(this.extensionContext) === undefined) {
+      void getMigrationModule().checkAndShowMigrationWizard(this.migrationCtx)
     }
     // legacy-migration end
   }
@@ -533,9 +555,15 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     void this.handleLoadSessions()
   }
 
-  /** Register a listener invoked when a plan follow-up session is adopted. */
-  public onFollowupAdopted(cb: (session: Session, directory: string) => void): void {
+  /** Register a listener invoked when a plan follow-up session is adopted.
+   *  Returns an unsubscribe function — callers MUST invoke it on teardown
+   *  (panel close, host re-attach) to avoid leaking the captured closure. */
+  public onFollowupAdopted(cb: (session: Session, directory: string) => void): () => void {
     this.followupListeners.push(cb)
+    return () => {
+      const idx = this.followupListeners.indexOf(cb)
+      if (idx >= 0) this.followupListeners.splice(idx, 1)
+    }
   }
 
   /** Recover permission/question prompts after sessions and directories are tracked. */
@@ -582,6 +610,13 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     options?: { onBeforeMessage?: (msg: Record<string, unknown>) => Promise<Record<string, unknown> | null> },
   ): void {
     this.isWebviewReady = false
+    // Drop listeners bound to any previous panel so we don't leak across re-attaches.
+    // resolveWebviewView/Panel already do this, but attachToWebview is also called
+    // from vscode-host.wrapExistingPanel for AM session deserialization.
+    this.viewStateDisposable?.dispose()
+    this.viewStateDisposable = null
+    this.visibilityDisposable?.dispose()
+    this.visibilityDisposable = null
     this.webview = webview
     if (!this.autoApproveBridge) this.onBeforeMessage = options?.onBeforeMessage ?? null
     this.setupWebviewMessageHandler(webview)
@@ -1026,21 +1061,21 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
           this.postMessage({ type: "favoritesLoaded", favorites })
           break
         }
-        // legacy-migration start
+        // legacy-migration start — module is lazy-loaded on first need.
         case "requestLegacyMigrationData":
-          void handleRequestLegacyMigrationData(this.migrationCtx)
+          void getMigrationModule().handleRequestLegacyMigrationData(this.migrationCtx)
           break
         case "startLegacyMigration":
-          void handleStartLegacyMigration(this.migrationCtx, message.selections)
+          void getMigrationModule().handleStartLegacyMigration(this.migrationCtx, message.selections)
           break
         case "skipLegacyMigration":
-          void handleSkipLegacyMigration(this.migrationCtx)
+          void getMigrationModule().handleSkipLegacyMigration(this.migrationCtx)
           break
         case "clearLegacyData":
-          void handleClearLegacyData(this.migrationCtx)
+          void getMigrationModule().handleClearLegacyData(this.migrationCtx)
           break
         case "finalizeLegacyMigration":
-          void handleFinalizeLegacyMigration(this.migrationCtx)
+          void getMigrationModule().handleFinalizeLegacyMigration(this.migrationCtx)
           break
         // legacy-migration end
         case "enhancePrompt": {
@@ -1601,6 +1636,10 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
       this.syncedChildSessions.delete(sessionID)
       this.sessionDirectories.delete(sessionID)
       this.lastReconciledAt.delete(sessionID)
+      // Drop any orphaned network-wait entries owned by this session — without
+      // this, deleting a session paused on a network wait leaks a global Map entry
+      // until extension-host restart (see kilo-provider/network.ts).
+      clearNetworkWaits(new Set([sessionID]))
       this.connectionService.pruneSession(sessionID)
       if (this.currentSession?.id === sessionID) {
         this.setCurrentSession(null)
@@ -2229,7 +2268,10 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
           const base = `${w.path}\n  ${w.message}`
           return w.detail ? `${base}\n  ${w.detail}` : base
         })
-        const channel = vscode.window.createOutputChannel("Kilo Config Warnings")
+        if (!this.configWarningsChannel) {
+          this.configWarningsChannel = vscode.window.createOutputChannel("Kilo Config Warnings")
+        }
+        const channel = this.configWarningsChannel
         channel.clear()
         channel.appendLine(lines.join("\n\n"))
         channel.show()
@@ -3138,7 +3180,11 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     const msg = mapSSEEventToWebviewMessage(event, sessionID)
     if (!msg) return
     if (msg.type === "partUpdated") {
-      this.streams.push({ ...msg, part: this.slimPart(msg.part) })
+      // Avoid an object-spread when slimPart returns the same reference
+      // (no metadata to trim, the common case for text/reasoning parts).
+      // Saves ~120-400 small allocations/sec/session in the SSE hot path.
+      const slimmed = this.slimPart(msg.part)
+      this.streams.push(slimmed === msg.part ? msg : { ...msg, part: slimmed })
       return
     }
     if (msg.type === "indexingStatusLoaded") {
@@ -3444,6 +3490,11 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
    */
   dispose(): void {
     this.unsubscribeRemote?.()
+    // Abort any in-flight loadMessages "replace" so a slow 10k-message
+    // deserialize doesn't keep its response buffer alive for the duration
+    // of the underlying socket.
+    this.loadMessagesAbort?.abort()
+    this.loadMessagesAbort = null
     this.focusSession()
     this.statsPoller?.stop()
     this.statsGitOps?.dispose()
@@ -3471,8 +3522,18 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     this.sessionDirectories.clear()
     this.permissionDirectories.clear()
     this.sessionStatusMap.clear()
+    this.lastReconciledAt.clear()
+    this.followupListeners.length = 0
+    this.pendingFollowup = null
+    this.configWarningsChannel?.dispose()
+    this.configWarningsChannel = null
     this.ignoreController?.dispose()
     this.chatAutocomplete?.dispose()
+    // Release the singleton's pointer back at this provider so its retained
+    // object graph (extensionContext-tied subs, autoApproveBridge, marketplace
+    // cache) can be GC'd. clearProviderIf only clears when this is still the
+    // active provider, so siblings don't accidentally clear each other.
+    TelemetryProxy.getInstance().clearProviderIf(this)
     ;(this.marketplace?.dispose(), disposeGitChangesTarget())
   }
 }

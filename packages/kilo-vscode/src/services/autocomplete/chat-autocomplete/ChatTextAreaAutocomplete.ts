@@ -38,15 +38,24 @@ export class ChatTextAreaAutocomplete {
   constructor(connectionService: KiloConnectionService, telemetry?: AutocompleteTelemetry) {
     this.connection = connectionService
     this.telemetry = telemetry ?? new AutocompleteTelemetry("chat-textarea")
-    this.watcher = vscode.workspace.createFileSystemWatcher("**/{.kilocodeignore,.gitignore}")
-    const invalidate = () => {
-      // Don't dispose — an in-flight request may still hold a reference.
-      // The old instance will be garbage collected once no longer referenced.
-      this.ignore = null
+    // Scope the watcher to the workspace root via RelativePattern. The previous
+    // "**/{.kilocodeignore,.gitignore}" glob recursively walked the entire
+    // workspace tree (including node_modules), creating tens of thousands of
+    // file watchers on monorepos. These ignore files only matter at the root.
+    const root = vscode.workspace.workspaceFolders?.[0]
+    if (root) {
+      this.watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(root, "{.kilocodeignore,.gitignore}"),
+      )
+      const invalidate = () => {
+        // Don't dispose — an in-flight request may still hold a reference.
+        // The old instance will be garbage collected once no longer referenced.
+        this.ignore = null
+      }
+      this.watcher.onDidChange(invalidate)
+      this.watcher.onDidCreate(invalidate)
+      this.watcher.onDidDelete(invalidate)
     }
-    this.watcher.onDidChange(invalidate)
-    this.watcher.onDidCreate(invalidate)
-    this.watcher.onDidDelete(invalidate)
   }
 
   /**

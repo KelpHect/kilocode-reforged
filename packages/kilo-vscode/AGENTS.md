@@ -268,12 +268,104 @@ The `spawn` wrapper covers long-lived processes (e.g. `kilo serve`). The `exec` 
 
 ## Style
 
-Follow monorepo root AGENTS.md style guide:
+Follow monorepo root AGENTS.md style guide and the **TypeScript Best Practices** section there:
 
 - Prefer `const` over `let`, early returns over `else`
 - Single-word variable names when possible
 - Avoid `try`/`catch`, avoid `any` type
 - ESLint enforces: curly braces, strict equality, semicolons, camelCase/PascalCase imports
+
+## SolidJS Best Practices
+
+Curated webview rules. The chat surface is streaming-heavy (60–200 SSE events/sec across multiple sessions), virtualized at two levels, and lives for hours — these rules are calibrated for that load.
+
+### Reactivity tracking & deps
+- **Untrack callback invocations inside reactive scopes.** When invoking `props.onX()` (or any user-supplied callback) inside `createEffect`/`createMemo`, wrap in `untrack(() => props.onX())`. Otherwise any signal the callback reads becomes a dep of the surrounding scope and causes phantom re-runs.
+- **Reusable helpers that read signals must self-untrack.** Any utility that internally reads stores/signals should wrap its body in `untrack` so callers don't accidentally subscribe.
+- **Use `batch()` only for multi-signal writes that drive DOM.** Group writes in IPC dispatch, scroll correction, and selection changes; do not blanket-batch single-signal writes.
+- **Never read a signal at module/component top level expecting reactivity.** Top-level reads run once at setup; only reads inside JSX, `createEffect`, `createMemo`, `createRenderEffect`, or returned function accessors are tracked.
+- **Conditional signal reads create conditional tracking.** A signal read guarded by `if (cond())` only re-runs the effect while the condition is true; if you need ongoing tracking, read it unconditionally before the branch.
+
+### Stores vs signals
+- **Default stores for any nested object/array > 2 fields.** Stores yield path-level reactivity; signals replace whole references and force every consumer to re-run.
+- **Use `reconcile` for whole-payload swaps; `produce` for SSE deltas.** `messagesLoaded` / session restore = `reconcile`. Streaming deltas where you have a path = `produce`.
+- **Resources are signals, not stores — replace, don't mutate.** `createResource` data is not a proxy; granular updates do not work. Use `mutate(newObj)` or re-key the source signal.
+- **Don't synchronize state with effects — derive it.** Replace `createEffect(() => setFullName(a()+b()))` with `const fullName = createMemo(() => a()+b())` (or a plain accessor for cheap derivations).
+
+### Component patterns (props as accessors)
+- **Never destructure `props`.** Destructuring snapshots accessors; `props.foo` must be read at the call site to stay reactive. Use `splitProps` when separating props for forwarding.
+- **Use `splitProps` (not rest spread) when forwarding.** `const [local, others] = splitProps(props, ["class","ref"])` keeps each forwarded property a live getter.
+- **Use `mergeProps` for defaults, not `||`/`??`.** `mergeProps({ size: "md" }, props).size` stays reactive; `props.size ?? "md"` does not.
+- **Pre-compute non-reactive values before passing as props.** JSX prop expressions become getters that re-run on every read; hoist any pure/expensive call to a `const` or `createMemo`.
+- **Pick `class` xor `classList` per element.** Mixing both produces non-deterministic class application; for dynamic styling on virtualized rows always use `classList={{...}}`.
+- **Use `<Dynamic component={…}>` over factory ternaries.** Avoids manual disposer juggling and keeps the component reference reactive.
+
+### Control flow
+- **`<For>` keys by reference, `<Index>` keys by position.** Chat messages/parts use `<For>`. `<Index>` only for fixed-length lists where you animate per slot.
+- **`<Show keyed>` recreates DOM/owner on truthy change.** Default `<Show>` keeps a single owner across truthy values; add `keyed` only when you specifically need per-value state recreation.
+- **Use `<ErrorBoundary>` at each chat row, not the whole tree.** One bad part shouldn't blank the chat.
+
+### Effects & lifecycle
+- **`createRenderEffect` for ref-dependent measurement, `createEffect` for IPC/focus/scroll, avoid `createComputed` outside primitives.**
+- **Register `onCleanup` *before* any `await` in resources/effects.** `onCleanup` after `await` does not bind to the current owner and leaks AbortControllers, EventSources, MutationObservers.
+- **Reach refs through `onMount` or callback refs, not synchronous read.** `let el; <div ref={el} />` is undefined during component setup; use `onMount(() => el.focus())` or `ref={(node) => …}`.
+
+### Memory & disposal (long-running webview)
+- **Every `createRoot` must pair with a stored `dispose` and an `onCleanup` from its parent owner.** Per-session detached roots must be disposed when the session is evicted *and* when the parent component unmounts.
+- **Resources clean up via abort signals.** Wire `onCleanup(() => controller.abort())` synchronously inside the fetcher; do not rely on the surrounding effect to cancel.
+- **Drop refs to large payloads on session swap.** `reconcile([])` (or store `null`) on stale message arrays so the prior structure is released; replacing with a new array still leaves the old one pinned by stale memos until their owner disposes.
+
+### Performance
+- **Lean toward more memos, not fewer — break-even is ~2 reads.** Solid memos have built-in equality and very low overhead; if a derivation is read in 2+ places, memoize.
+- **Use a memo as a *reactivity filter* on noisy signals.** `createMemo(fn, undefined, { equals: (a,b) => a.id === b.id })` blocks unnecessary propagation when only the id matters.
+- **Pass a custom `equals` to `createMemo` for derived collections.** Default `===` on a freshly-allocated array always reports change; supply an `(a,b) => a.length === b.length && a.every((x,i)=>x===b[i])`-style comparator.
+- **Stabilize identity of objects passed as props.** Inline `{ style: { color: c() } }` rebuilds every read; lift to a memo when the consumer compares by reference.
+- **For virtualized rows, isolate per-row owners.** Render each row inside a component (so its memos/effects dispose with the row), not as inline JSX in the virtualizer's render function.
+
+### Anti-patterns
+- **Effects that `setX(x())` from another signal** — state synchronization. Use a memo or accessor.
+- **Index keys on `<For>` of mutable lists** — breaks DOM reuse on insert/reorder; key by message/part id.
+- **Mutating store objects outside `setStore`/`produce`** — bypasses the proxy; no consumers re-run.
+- **Inline arrows that close over signals read at construction** — `onClick={() => doThing(value)}` where `value` is captured non-reactively. Either read inside (`onClick={() => doThing(value())}`) or hoist.
+
+### Accessibility for animations
+- **Gate JS-driven animations on `prefers-reduced-motion`.** In a Solid effect, read `window.matchMedia('(prefers-reduced-motion: reduce)').matches`; subscribe to its `change` event in `onMount`/`onCleanup`.
+- **Mirror the gate in CSS.** All keyframe animations must live inside `@media (prefers-reduced-motion: no-preference)` (the `motion.css` global override is a safety net, not a substitute).
+
+## Webview Performance — Advanced Patterns
+
+These are **not yet applied** but are calibrated for our SSE/IPC/streaming load. Apply when the corresponding hot path becomes the bottleneck (validate with a benchmark/profile first).
+
+### VS Code webview IPC
+- **Pass the `transfer` argument to `webview.postMessage` for ArrayBuffers.** `postMessage(message, transfer?: readonly ArrayBuffer[])`. Without it, typed arrays serialize as `{"0":0,"1":0,...}` per byte. Use for attachments, embeddings, large diff payloads.
+- **Coalesce `postMessage` calls in a single microtask via a per-tick flush.** Each post is an IPC trip; at 200 evt/sec the syscall overhead dominates. Batch and decode `events: T[]` on the receiver.
+- **Bypass JSON for high-frequency stream-deltas via a single `Uint8Array` frame** (sessionId hash | partId | offset | bytes). Structured-clone fast path on `ArrayBuffer` is much faster than `JSON.stringify` over an object tree, especially with `transfer`.
+
+### Streaming pipelines
+- **Replace `requestIdleCallback` with `scheduler.postTask({priority:'background'})` for non-critical work.** `requestIdleCallback` will not fire under sustained UI activity (exactly what scrolling chat does). `scheduler.postTask` integrates with `AbortSignal`.
+- **Yield with `scheduler.yield()` (or `await new Promise(r => setTimeout(r,0))`) every ~5 ms inside long parse loops.** Microtasks (`await Promise.resolve()`) do not yield to the event loop.
+- **Tie streaming abort signals to `document.visibilityState`.** Suspend rendering work (markdown parse, syntax highlight) while the webview is hidden; resume from buffered raw text on visibility change.
+
+### TanStack Virtual
+- **Set `estimateSize` to the P75 of measured heights, not the median.** Underestimation causes inverted-list scroll stutter and "items above shove visible items down" jumps.
+- **Round `measureElement` return to whole pixels and skip remeasure when delta < 1px.** Sub-pixel jitter from font reflow re-triggers measurement on scroll.
+- **Cap inner `overscan` to 3–5 with a two-tier virtualizer.** `overscan_outer × overscan_inner` items shadow-render per scroll.
+- **Disable smooth-scroll while a stream is appending.** Animated scroll competes with the resize observer driving `measureElement`.
+
+### Markdown / syntax highlighting
+- **Switch streaming markdown to an incremental parser** (stable vs unstable block split) instead of re-running `marked` per delta. Re-parsing the full transcript per delta is O(n²) over session length; reference impls report 2–46× speedups.
+- **Use shiki's fine-grained bundle (`shiki/core` + explicit grammar imports), not the default bundle.** Default ships ~1.2 MB gz with all grammars resident; fine-grained core is ~12 KB plus only your imports.
+- **Highlight code blocks in a Web Worker, not the main thread.** Tokenization is CPU-bound; isolate 100 ms tokenize spikes from scroll.
+- **Cache shiki output by content hash, not block id.** Identical code blocks (e.g., repeated `npm install`) collapse to one highlight.
+
+### Memory / GC
+- **Cache rendered markdown in `WeakRef`s keyed off the message object, with a `FinalizationRegistry` for index cleanup.** Lets GC reclaim large rendered trees on memory pressure; pair with a parallel size-bounded LRU of strong refs to recent items.
+- **Persist long sessions to IndexedDB; keep only the recent N turns hydrated in the Solid store.** Hours-long sessions accumulate thousands of part objects in JS heap.
+- **Store large immutable blobs (raw SSE log, attachments) as `Blob`/`ArrayBuffer` references, not as strings on store nodes.** Strings are V8-heap-resident; Blobs can be off-heap.
+
+### References
+
+Sources synthesized: [SolidJS docs](https://docs.solidjs.com/), [Brenelz best practices](https://www.brenelz.com/posts/solid-js-best-practices/), [Bejamas practical guide](https://bejamas.com/hub/tutorials/practical-guide-to-solidjs-library), [SolidJS pain points](https://vladislav-lipatov.medium.com/solidjs-pain-points-and-pitfalls-a693f62fcb4c), [TanStack Virtual](https://tanstack.com/virtual/latest/docs/api/virtualizer), [shiki perf guide](https://shiki.style/guide/best-performance), [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview), [scheduler.postTask](https://developer.mozilla.org/en-US/docs/Web/API/Scheduler/postTask), [V8 hidden classes](https://v8.dev/blog/fast-properties).
 
 ## File Size Caps (maxLines)
 

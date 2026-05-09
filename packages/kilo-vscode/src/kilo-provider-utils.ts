@@ -3,6 +3,7 @@ import { prettifyError } from "zod/v4"
 import type { CloudSessionMessage, IndexingStatus } from "./services/cli-backend/types"
 import type { PartBatch, PartUpdate } from "./kilo-provider/session-stream-scheduler"
 import type { PartRemove } from "./shared/stream-messages"
+import { slimParts } from "./kilo-provider/slim-metadata"
 
 export { SessionStreamScheduler } from "./kilo-provider/session-stream-scheduler"
 
@@ -585,7 +586,13 @@ export function mapCloudSessionMessageToWebviewMessage(message: CloudSessionMess
     id: message.info.id,
     sessionID: message.info.sessionID,
     role: message.info.role as "user" | "assistant",
-    parts: message.parts,
+    // slimParts strips edit/write/apply_patch before/after, caps bash output,
+    // and bounds rendered patches. Without this, cloud previews of long
+    // sessions shipped multi-MB postMessage payloads (file contents and raw
+    // patch text) over the IPC bridge, hanging the webview for several
+    // seconds during JSON.stringify→parse. Local loadMessages already passes
+    // through the same slimmer in KiloProvider.handleLoadMessages.
+    parts: slimParts(message.parts),
     createdAt: message.info.time?.created
       ? new Date(message.info.time.created).toISOString()
       : new Date().toISOString(),

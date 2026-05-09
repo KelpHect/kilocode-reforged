@@ -172,9 +172,17 @@ export class SdkSSEAdapter {
 
           // The SDK yields GlobalEvent = { directory, payload: Event }.
           const globalEvent = event as GlobalEvent
-          const type = (globalEvent.payload as { type: string }).type
-          if (type !== "server.heartbeat") {
-            console.log("[Kilo New] SSE: 📨 Event:", type)
+          // Per-event console.log is the dominant noise channel during
+          // streaming (~80 events/sec for a single response), and the
+          // hot-frequency `message.part.updated` is the main culprit.
+          // Gate behind KILO_SSE_VERBOSE so production runs stay quiet —
+          // VS Code's developer-tools console buffer and the Windows writev
+          // path both pay a noticeable cumulative cost otherwise.
+          if (process.env.KILO_SSE_VERBOSE) {
+            const type = (globalEvent.payload as { type: string }).type
+            if (type !== "server.heartbeat" && type !== "message.part.updated") {
+              console.log("[Kilo New] SSE: 📨 Event:", type)
+            }
           }
           this.notifyEvent(globalEvent.payload as Event, globalEvent.directory)
         }

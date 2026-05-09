@@ -115,6 +115,7 @@ export function stableMessageTurns(next: MessageTurn[], prev: MessageTurn[] = []
 }
 
 function active(messages: Message[]) {
+  let byId: Map<string, Message> | undefined
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i]
     if (!msg || msg.role !== "assistant") continue
@@ -122,7 +123,12 @@ function active(messages: Message[]) {
     if (msg.error) continue
     if (msg.finish && !["tool-calls", "unknown"].includes(msg.finish)) continue
     if (!msg.parentID) break
-    const parent = messages.find((item) => item.id === msg.parentID)
+    // Lazy id index — only built when we actually need to look up a parent.
+    // The previous `messages.find(...)` was O(N) per call against a possibly
+    // 80+-item paginated list; for streaming sessions where this runs on
+    // every turnMeta tick it added up.
+    byId ??= new Map(messages.map((m) => [m.id, m]))
+    const parent = byId.get(msg.parentID)
     if (parent?.role === "user") return parent.id
     break
   }

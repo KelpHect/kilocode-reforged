@@ -7,7 +7,7 @@
  * Active questions render inline via QuestionDock; permissions are in the bottom dock.
  */
 
-import { Component, For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js"
+import { Component, For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js"
 import { Dynamic } from "solid-js/web"
 import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Part, PART_MAPPING, ToolRegistry } from "@kilocode/kilo-ui/message-part"
@@ -55,18 +55,32 @@ function isRenderable(part: SDKPart): boolean {
 }
 
 /**
- * Match a tool part to an active request (question or suggestion) by tool name
- * and callID/messageID. Returns the matched request or undefined.
+ * Build a callID:messageID lookup map for a request list. The previous
+ * matchToolRequest helper was called per-part inside two memos, doing an
+ * O(Q) linear scan for every renderable part on every reactive tick — for
+ * 80 parts × 4 questions that's 640 .find() walks per question keystroke.
+ * Building the map once per dock change makes per-part lookup O(1).
  */
-function matchToolRequest<T extends { tool?: { callID: string; messageID: string } }>(
-  part: SDKPart,
+function buildToolRequestIndex<T extends { tool?: { callID: string; messageID: string } }>(
   name: string,
   requests: T[],
-): T | undefined {
+): Map<string, T> {
+  const m = new Map<string, T>()
+  for (const r of requests) {
+    if (r.tool && (r as unknown as { tool: { tool: string } }).tool?.tool !== undefined) {
+      // request shape: { tool: { tool: name, callID, messageID, ... } } — strict-typed at the call site
+    }
+    if (r.tool) m.set(`${name}:${r.tool.callID}:${r.tool.messageID}`, r)
+  }
+  return m
+}
+
+/** Look up a request by tool part. O(1) against an index built by buildToolRequestIndex. */
+function lookupToolRequest<T>(part: SDKPart, name: string, index: Map<string, T>): T | undefined {
   if (part.type !== "tool") return undefined
   const tp = part as unknown as ToolPart
   if (tp.tool !== name) return undefined
-  return requests.find((r) => r.tool?.callID === tp.callID && r.tool?.messageID === tp.messageID)
+  return index.get(`${name}:${tp.callID}:${tp.messageID}`)
 }
 
 interface AssistantMessageProps {
@@ -182,68 +196,75 @@ export const AssistantMessage: Component<AssistantMessageProps> = (props) => {
 
   const virtualItems = createMemo(() => virtualizer.getVirtualItems())
 
+  // Hoist the question/suggestion lookups to one Map per AssistantMessage
+  // rather than allocating two createMemos per part per render. Previously
+  // each renderPart() call subscribed to session.questions()/suggestions()
+  // and did an O(Q) .find() — for an 80-part assistant message with a
+  // 4-question dock that was 640 scans per question keystroke. Now: build
+  // index once when the dock changes, O(1) lookup per part.
+  const questionIndex = createMemo(() => buildToolRequestIndex("question", session.questions()))
+  const suggestionIndex = createMemo(() => buildToolRequestIndex("suggest", session.suggestions()))
+
   const renderPart = (part: SDKPart) => {
     // Upstream PART_MAPPING["tool"] returns null for todowrite/todoread,
     // so we detect them here and render via ToolRegistry directly.
     const isUpstreamSuppressed =
       part.type === "tool" && UPSTREAM_SUPPRESSED_TOOLS.has((part as SDKPart & { tool: string }).tool)
 
-    // Active question tool parts render the interactive QuestionDock inline
-    const activeQuestion = createMemo(() => matchToolRequest(part, "question", session.questions()))
-
-    // Active suggestion tool parts render the interactive SuggestBar inline
-    const activeSuggestion = createMemo(() => matchToolRequest(part, "suggest", session.suggestions()))
-    const bash = createMemo(() => {
-      if (part.type !== "tool") return
-      const tool = part as unknown as ToolPart
-      if (tool.tool !== "bash") return
-      if (tool.state?.status === "error") return
-      return part
+    // Single classifier — replaces a 5-deep <Show> cascade where every
+    // fallback re-evaluated the predicates above it. Switch/Match runs
+    // exactly the matching branch and skips the rest.
+    type PartKind =
+      | { kind: "question"; req: NonNullable<ReturnType<typeof lookupToolRequest>> }
+      | { kind: "suggest"; req: NonNullable<ReturnType<typeof lookupToolRequest>> }
+      | { kind: "bash" }
+      | { kind: "todo" }
+      | { kind: "default" }
+      | { kind: "skip" }
+    const classify = createMemo<PartKind>(() => {
+      if (part.type === "tool") {
+        const tp = part as unknown as ToolPart
+        const q = lookupToolRequest(part, "question", questionIndex())
+        if (q) return { kind: "question", req: q }
+        const s = lookupToolRequest(part, "suggest", suggestionIndex())
+        if (s) return { kind: "suggest", req: s }
+        if (tp.tool === "bash" && tp.state?.status !== "error") return { kind: "bash" }
+        if (isUpstreamSuppressed) return { kind: "todo" }
+      }
+      return PART_MAPPING[part.type] ? { kind: "default" } : { kind: "skip" }
     })
 
     return (
-      <Show when={isUpstreamSuppressed || activeQuestion() || activeSuggestion() || bash() || PART_MAPPING[part.type]}>
+      <Show when={classify().kind !== "skip"}>
         <div data-component="tool-part-wrapper" data-part-type={part.type}>
-          <Show
-            when={activeQuestion()}
-            fallback={
-              <Show
-                when={activeSuggestion()}
-                fallback={
-                  <Show
-                    when={bash()}
-                    fallback={
-                      <Show
-                        when={isUpstreamSuppressed}
-                        fallback={
-                          <Part
-                            part={part}
-                            message={props.message as SDKMessage}
-                            showAssistantCopyPartID={props.showAssistantCopyPartID}
-                            reasoningAutoCollapse={display.reasoningAutoCollapse()}
-                            feedback={props.feedback}
-                            animate={
-                              part.type === "tool" &&
-                              ((part as unknown as ToolPart).state?.status === "pending" ||
-                                (part as unknown as ToolPart).state?.status === "running")
-                            }
-                          />
-                        }
-                      >
-                        <TodoToolCard part={part as unknown as ToolPart} />
-                      </Show>
-                    }
-                  >
-                    {(tool) => <BashToolCard part={tool() as unknown as ToolPart} defaultOpen={open()} />}
-                  </Show>
+          <Switch>
+            <Match when={classify().kind === "question" && (classify() as { req: unknown }).req}>
+              {(req) => <QuestionDock request={req() as never} />}
+            </Match>
+            <Match when={classify().kind === "suggest" && (classify() as { req: unknown }).req}>
+              {(req) => <SuggestBar request={req() as never} />}
+            </Match>
+            <Match when={classify().kind === "bash"}>
+              <BashToolCard part={part as unknown as ToolPart} defaultOpen={open()} />
+            </Match>
+            <Match when={classify().kind === "todo"}>
+              <TodoToolCard part={part as unknown as ToolPart} />
+            </Match>
+            <Match when={classify().kind === "default"}>
+              <Part
+                part={part}
+                message={props.message as SDKMessage}
+                showAssistantCopyPartID={props.showAssistantCopyPartID}
+                reasoningAutoCollapse={display.reasoningAutoCollapse()}
+                feedback={props.feedback}
+                animate={
+                  part.type === "tool" &&
+                  ((part as unknown as ToolPart).state?.status === "pending" ||
+                    (part as unknown as ToolPart).state?.status === "running")
                 }
-              >
-                {(req) => <SuggestBar request={req()} />}
-              </Show>
-            }
-          >
-            {(req) => <QuestionDock request={req()} />}
-          </Show>
+              />
+            </Match>
+          </Switch>
         </div>
       </Show>
     )

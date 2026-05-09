@@ -217,7 +217,7 @@ export class AgentManagerProvider implements Disposable {
       this.statsPoller.setVisible(visible)
     })
 
-    ctx.sessions.onFollowupAdopted((session, directory) => {
+    const unsubFollowup = ctx.sessions.onFollowupAdopted((session, directory) => {
       this.adoptFollowupInWorktree(session, directory)
     })
 
@@ -235,6 +235,7 @@ export class AgentManagerProvider implements Disposable {
         this.diffs.stop()
         this.panel = undefined
       }
+      unsubFollowup()
       ctx.sessions.dispose()
     })
   }
@@ -408,6 +409,10 @@ export class AgentManagerProvider implements Disposable {
           return
         }
         state.removeSession(m.sessionId)
+        // Drop any terminal owned by the deleted session — without this the
+        // SessionTerminalManager.terminals Map kept the TerminalHandle alive
+        // until panel teardown.
+        this.terminalManager.removeSession(m.sessionId)
       })
       return null
     }
@@ -1128,6 +1133,7 @@ export class AgentManagerProvider implements Disposable {
     if (!state) return null
 
     state.removeSession(sessionId)
+    this.terminalManager.removeSession(sessionId)
     this.pushState()
     this.log(`Closed session ${sessionId}`)
     return null

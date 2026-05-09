@@ -135,7 +135,22 @@ export class WorktreeManager {
       () => {},
     )
     WorktreeManager.locks.set(key, barrier)
+    // Self-clean: remove the barrier once it settles, unless a newer barrier
+    // already replaced it. Otherwise the static Map kept resolved promises
+    // pinned to every repo root for the lifetime of the extension host.
+    void barrier.then(() => {
+      if (WorktreeManager.locks.get(key) === barrier) WorktreeManager.locks.delete(key)
+    })
     return result
+  }
+
+  /** Drop any fetchCache entries that have aged past the TTL. Called inline
+   *  before each fetchCache.set so stale repo:remote:branch tuples (e.g. CI
+   *  branches that rotate) don't accumulate forever in the static Map. */
+  private static evictStaleFetches(now: number): void {
+    for (const [k, t] of WorktreeManager.fetchCache) {
+      if (now - t > WorktreeManager.FETCH_CACHE_TTL) WorktreeManager.fetchCache.delete(k)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -698,7 +713,9 @@ export class WorktreeManager {
         await simpleGit(this.root, { unsafe: { allowUnsafeSshCommand: isKiloOwnedSshCommand(env) } })
           .env(env)
           .fetch(remote, branch, { "--quiet": null, "--no-tags": null })
-        WorktreeManager.fetchCache.set(cacheKey, Date.now())
+        const now = Date.now()
+        WorktreeManager.evictStaleFetches(now)
+        WorktreeManager.fetchCache.set(cacheKey, now)
         if (await this.refExistsLocally(`${remote}/${branch}`)) {
           return {
             ref: `${remote}/${branch}`,

@@ -9,7 +9,7 @@
  * The command buttons (Deny / Run) control the current command.
  */
 
-import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Button } from "@kilocode/kilo-ui/button"
@@ -203,11 +203,11 @@ export const PermissionDock: Component<{
 
   // Listen only while this permission is rendered. This keeps shortcuts working
   // when the prompt input owns focus without forcing focus onto the dock.
-  createEffect(() => {
-    void props.request.id
-    document.addEventListener("keydown", onKey, true)
-    onCleanup(() => document.removeEventListener("keydown", onKey, true))
-  })
+  // onKey reads `props.request.id` lazily, so we don't need to rebind the
+  // listener every time the id changes — that just churned add/removeEventListener
+  // and risked dropping a queued keystroke during the rebind window.
+  onMount(() => document.addEventListener("keydown", onKey, true))
+  onCleanup(() => document.removeEventListener("keydown", onKey, true))
 
   const renderRule = (rule: string, index: number) => (
     <div data-slot="permission-rule-row" data-decision={decision(index)}>
@@ -341,7 +341,34 @@ export const PermissionDock: Component<{
 
         <Show when={diffs().length > 0}>
           <div data-slot="permission-diffs" data-count={diffs().length}>
-            <For each={diffs()}>{(diff) => <PermissionDiff filediff={diff} />}</For>
+            {/* Eagerly mount the first 5 diffs (covers the common case where
+                the user can see them all at once); lazy-mount the rest behind
+                an expand toggle so a 40-file multiedit doesn't pay 40×
+                PermissionDiff render cost on dock open. */}
+            <For each={diffs().slice(0, 5)}>{(diff) => <PermissionDiff filediff={diff} />}</For>
+            <Show when={diffs().length > 5}>
+              {(() => {
+                const [showAll, setShowAll] = createSignal(false)
+                return (
+                  <>
+                    <Show
+                      when={showAll()}
+                      fallback={
+                        <button
+                          data-slot="permission-diff-show-more"
+                          type="button"
+                          onClick={() => setShowAll(true)}
+                        >
+                          {`+ ${diffs().length - 5} more`}
+                        </button>
+                      }
+                    >
+                      <For each={diffs().slice(5)}>{(diff) => <PermissionDiff filediff={diff} />}</For>
+                    </Show>
+                  </>
+                )
+              })()}
+            </Show>
           </div>
         </Show>
 

@@ -1,4 +1,5 @@
 import { createSignal, createMemo, For, Show } from "solid-js"
+import { debounce } from "@solid-primitives/scheduled"
 import { TextField } from "@kilocode/kilo-ui/text-field"
 import { Select } from "@kilocode/kilo-ui/select"
 import { Tag } from "@kilocode/kilo-ui/tag"
@@ -32,9 +33,40 @@ interface Props {
 
 export const MarketplaceListView = (props: Props) => {
   const { t } = useLanguage()
+  // Two-tier search state: `searchInput` is bound to the TextField and reflects
+  // every keystroke; `search` is debounced and drives `filtered`. The previous
+  // implementation re-ran the O(n) lowercase filter on every keystroke against
+  // 1800-item lists, causing visible typing latency.
+  const [searchInput, setSearchInput] = createSignal("")
   const [search, setSearch] = createSignal("")
+  const debouncedSetSearch = debounce((v: string) => setSearch(v), 100)
+  const onSearchInput = (v: string) => {
+    setSearchInput(v)
+    debouncedSetSearch(v)
+  }
   const [status, setStatus] = createSignal<StatusOption>({ value: "all", label: t("marketplace.filter.all") })
   const [tags, setTags] = createSignal<string[]>([])
+
+  // Pre-build a lowercased search index per item — `id|name|description|author
+  // |displayName` joined into a single string for substring matching. Built
+  // once per items reference; re-runs only when the upstream marketplace
+  // payload changes (rare). Avoids repeatedly lowercasing every field on
+  // every keystroke for 1800 items.
+  const searchIndex = createMemo(() => {
+    const idx = new Map<string, string>()
+    for (const item of props.items) {
+      const skill = item.type === "skill" ? (item as SkillMarketplaceItem) : undefined
+      const parts = [
+        item.id,
+        item.name,
+        item.description,
+        item.author ?? "",
+        skill?.displayName ?? "",
+      ]
+      idx.set(item.id, parts.join("\n").toLowerCase())
+    }
+    return idx
+  })
 
   const options = (): StatusOption[] => [
     { value: "all", label: t("marketplace.filter.all") },
@@ -72,19 +104,14 @@ export const MarketplaceListView = (props: Props) => {
     const q = search().toLowerCase()
     const s = status().value
     const active = tags()
+    const idx = searchIndex()
     return props.items.filter((item) => {
       if (s === "installed" && !isInstalled(item.id, item.type, props.metadata)) return false
       if (s === "notInstalled" && isInstalled(item.id, item.type, props.metadata)) return false
       if (active.length > 0 && !active.some((tag) => tagsFor(item).includes(tag))) return false
       if (!q) return true
-      const skill = item.type === "skill" ? (item as SkillMarketplaceItem) : undefined
-      return (
-        item.id.toLowerCase().includes(q) ||
-        item.name.toLowerCase().includes(q) ||
-        item.description.toLowerCase().includes(q) ||
-        (item.author?.toLowerCase().includes(q) ?? false) ||
-        (skill?.displayName.toLowerCase().includes(q) ?? false)
-      )
+      const haystack = idx.get(item.id)
+      return haystack ? haystack.includes(q) : false
     })
   })
 
@@ -92,7 +119,7 @@ export const MarketplaceListView = (props: Props) => {
     <div class="marketplace-list">
       <div class="marketplace-filters">
         <div class="marketplace-search-field">
-          <TextField placeholder={props.searchPlaceholder} value={search()} onChange={setSearch} />
+          <TextField placeholder={props.searchPlaceholder} value={searchInput()} onChange={onSearchInput} />
         </div>
         <Select
           options={options()}

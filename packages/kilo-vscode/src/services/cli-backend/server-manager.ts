@@ -225,26 +225,42 @@ export class ServerManager {
   }
 
   dispose(): void {
-    if (!this.instance) {
-      return
-    }
+    void this.disposeAsync()
+  }
+
+  /**
+   * Async-aware shutdown. Sends SIGTERM, races a 3-second timeout, then
+   * falls back to SIGKILL and awaits actual process exit. Use this from the
+   * extension's `deactivate()` so VS Code waits for the CLI to die before
+   * unloading the extension host — without it, orphan `kilo.exe` processes
+   * can outlive the extension on Windows.
+   */
+  async disposeAsync(): Promise<void> {
+    if (!this.instance) return
     const proc = this.instance.process
     this.instance = null
 
     console.log("[Kilo New] ServerManager: 🔴 Disposing — sending SIGTERM to process group, PID:", proc.pid)
     ServerManager.killProcess(proc, "SIGTERM")
 
-    // SIGKILL fallback after 5s. Ensures the process tree dies even if SIGTERM is ignored
-    // or Instance.disposeAll() hangs past the serve.ts shutdown timeout.
-    const timer = setTimeout(() => {
-      if (proc.exitCode === null) {
-        console.warn("[Kilo New] ServerManager: ⚠️ Process did not exit after SIGTERM, sending SIGKILL")
-        ServerManager.killProcess(proc, "SIGKILL")
-      }
-    }, 5000)
-    // unref so this timer doesn't prevent the extension host from exiting
-    timer.unref()
-    proc.on("exit", () => clearTimeout(timer))
+    if (proc.exitCode !== null) return
+
+    const exitPromise = new Promise<void>((resolve) => {
+      proc.once("exit", () => resolve())
+    })
+    const timeoutMs = 3000
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    const timeout = new Promise<"timeout">((resolve) => {
+      timeoutId = setTimeout(() => resolve("timeout"), timeoutMs)
+      timeoutId.unref?.()
+    })
+    const result = await Promise.race([exitPromise.then(() => "exit" as const), timeout])
+    if (timeoutId) clearTimeout(timeoutId)
+    if (result === "exit") return
+
+    console.warn("[Kilo New] ServerManager: ⚠️ Process did not exit after SIGTERM, sending SIGKILL")
+    ServerManager.killProcess(proc, "SIGKILL")
+    await exitPromise
   }
 }
 

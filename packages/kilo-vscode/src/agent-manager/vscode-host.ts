@@ -104,6 +104,7 @@ export class VscodeHost implements Host {
       registerSession: (s) => provider.registerSession(s),
       recoverPendingPrompts: () => provider.recoverPendingPrompts(),
       onFollowupAdopted: (cb) => provider.onFollowupAdopted(cb),
+      // host.ts contract: onFollowupAdopted returns the unsubscribe; pass-through preserves it.
       dispose: () => provider.dispose(),
     }
 

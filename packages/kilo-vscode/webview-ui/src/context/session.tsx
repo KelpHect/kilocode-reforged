@@ -315,6 +315,37 @@ export const SessionProvider: ParentComponent = (props) => {
   const scopedQuestionsMemos = new Map<string, DisposableMemo<QuestionRequest[]>>()
   const scopedSuggestionsMemos = new Map<string, DisposableMemo<SuggestionRequest[]>>()
 
+  // Incremental session-family adjacency. Previously computeSessionFamily
+  // walked store.messages / store.parts BFS-style, subscribing to thousands
+  // of reactive reads — every part-delta re-ran the entire walk and cascaded
+  // into 5+ downstream memos (scopedPermissions/Questions/Suggestions, costs,
+  // labels, statusText). With an explicit parent→child map maintained at
+  // ingest time, family lookup is O(family-depth) and only invalidates when
+  // a *new* child relationship is discovered.
+  const sessionChildren = new Map<string, Set<string>>()
+  const sessionParent = new Map<string, string>()
+  const familyCache = new Map<string, { v: Set<string>; rev: number }>()
+  // Reactive bump used by computeSessionFamily memos. Increment whenever a
+  // new (parent, child) edge is added so consumers re-run the cached walk.
+  const [familyRev, setFamilyRev] = createSignal(0)
+
+  /** Register a (parent, child) session edge. Called from mergePartUpdate
+   *  when a tool=task part's metadata.sessionId points at a new child.
+   *  No-ops on duplicates so streaming text-deltas don't churn the rev. */
+  function registerSessionEdge(parentSid: string, childSid: string): void {
+    if (parentSid === childSid) return
+    if (sessionParent.get(childSid) === parentSid) return
+    sessionParent.set(childSid, parentSid)
+    let kids = sessionChildren.get(parentSid)
+    if (!kids) {
+      kids = new Set()
+      sessionChildren.set(parentSid, kids)
+    }
+    if (kids.has(childSid)) return
+    kids.add(childSid)
+    setFamilyRev((r) => r + 1)
+  }
+
   function disposeFamilyMemosFor(sessionID: string) {
     familyMemos.get(sessionID)?.dispose()
     familyMemos.delete(sessionID)
@@ -324,6 +355,28 @@ export const SessionProvider: ParentComponent = (props) => {
     scopedQuestionsMemos.delete(sessionID)
     scopedSuggestionsMemos.get(sessionID)?.dispose()
     scopedSuggestionsMemos.delete(sessionID)
+    familyCache.delete(sessionID)
+    // NOTE: Adjacency (`sessionChildren` / `sessionParent`) is intentionally
+    // *not* cleared here. parkSessionParts() calls this on every session
+    // switch — clearing edges would force a re-walk on every re-entry. Edges
+    // are erased only on session *delete* via dropAdjacencyFor().
+  }
+
+  /** Drop parent→child adjacency for a deleted session. Keep entries that
+   *  point AT live sessions so re-entering surviving parents still resolves
+   *  their family deterministically. */
+  function dropAdjacencyFor(sessionID: string): void {
+    const kids = sessionChildren.get(sessionID)
+    const hadParent = sessionParent.delete(sessionID)
+    if (!kids && !hadParent) return
+    if (kids) {
+      for (const child of kids) sessionParent.delete(child)
+      sessionChildren.delete(sessionID)
+    }
+    // Only bump familyRev when adjacency actually changed — otherwise every
+    // unrelated leaf-session delete would invalidate every other session's
+    // family memo cache.
+    setFamilyRev((r) => r + 1)
   }
 
   // Pending permissions
@@ -558,12 +611,21 @@ export const SessionProvider: ParentComponent = (props) => {
   }
 
   function hideErrors(sid: string) {
-    const ids = errorIDs(store.messages[sid] ?? [])
-    if (ids.length === 0) return
+    const msgs = store.messages[sid]
+    if (!msgs?.length) return
+    // Single-pass scan that allocates the Set only when there's something
+    // new to add. errorIDs walked + filtered + mapped the message list,
+    // and the previous setHiddenErrors callback always allocated a new Set
+    // even when nothing changed.
     setHiddenErrors((prev) => {
-      const next = new Set(prev)
-      for (const id of ids) next.add(id)
-      return next
+      let next: Set<string> | undefined
+      for (const m of msgs) {
+        if (!m.error) continue
+        if (prev.has(m.id)) continue
+        next ??= new Set(prev)
+        next.add(m.id)
+      }
+      return next ?? prev
     })
   }
 
@@ -619,13 +681,17 @@ export const SessionProvider: ParentComponent = (props) => {
     vscode.postMessage({ type: "clearModelSelection", agent: agentName })
   }
 
+  // Track the agent-name set that was last used to recover prefs so we can
+  // skip the full-store rescan when nothing changed (settings save with no
+  // agent edits, redundant agentsLoaded pushes after profile reattach, etc.).
+  let lastAgentNamesKey = ""
+  const namesKey = (s: Set<string>) => [...s].sort().join("|")
+
   // Handle agentsLoaded immediately (not in onMount) so we never miss
   // the initial push that arrives before the DOM mounts. This mirrors the
   // pattern used by ProviderProvider for providersLoaded.
-  const unsubAgents = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "agentsLoaded") {
-      return
-    }
+  // Uses onMessageFor so this handler doesn't run for unrelated SSE traffic.
+  const unsubAgents = vscode.onMessageFor("agentsLoaded", (message) => {
     setAgents(message.agents)
     setAllAgents(message.allAgents ?? message.agents)
     setDefaultAgent(message.defaultAgent)
@@ -650,12 +716,24 @@ export const SessionProvider: ParentComponent = (props) => {
 
     // Rescan already-loaded message history so sessions whose messagesLoaded
     // arrived before agentsLoaded (and therefore got no agent selection) are
-    // backfilled now that we know the valid agent names.
-    batch(() => {
-      for (const [sid, msgs] of Object.entries(store.messages)) {
-        recoverPrefs(sid, msgs, names)
-      }
-    })
+    // backfilled now that we know the valid agent names. Idempotent: skip
+    // when the agent-name set is unchanged AND skip individual sessions whose
+    // selection is already valid against the new names — most settings saves
+    // don't change agent names, so this turns a 10–30 ms hitch into a no-op.
+    // Iterate via `for…in` so we don't allocate the Object.entries snapshot
+    // on every settings save.
+    const key = namesKey(names)
+    if (key !== lastAgentNamesKey) {
+      lastAgentNamesKey = key
+      batch(() => {
+        for (const sid in store.messages) {
+          const sel = store.agentSelections[sid]
+          if (sel && names.has(sel)) continue
+          const msgs = store.messages[sid]
+          if (msgs) recoverPrefs(sid, msgs, names)
+        }
+      })
+    }
   })
 
   // Request agents immediately; if the extension's httpClient is not yet ready,
@@ -663,10 +741,8 @@ export const SessionProvider: ParentComponent = (props) => {
   vscode.postMessage({ type: "requestAgents" })
 
   // Skills loaded from the CLI backend
-  const unsubSkills = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type === "skillsLoaded") {
-      setSkills(message.skills)
-    }
+  const unsubSkills = vscode.onMessageFor("skillsLoaded", (message) => {
+    setSkills(message.skills)
   })
 
   const refreshSkills = () => {
@@ -681,27 +757,20 @@ export const SessionProvider: ParentComponent = (props) => {
   // Handle permission events immediately (not in onMount) so we never miss
   // the first permission request that may arrive before the DOM mounts.
   // This matches the pattern already used for agentsLoaded and skillsLoaded.
-  const unsubPermissions = vscode.onMessage((message: ExtensionMessage) => {
-    switch (message.type) {
-      case "permissionRequest":
-        handlePermissionRequest(message.permission)
-        break
-      case "permissionResolved":
-        handlePermissionResolved(message.permissionID)
-        break
-      case "permissionError":
-        handlePermissionError(message.permissionID, message.stale)
-        break
-    }
+  // Split per-type so unrelated SSE traffic doesn't run any of these handlers.
+  const unsubPermReq = vscode.onMessageFor("permissionRequest", (m) => handlePermissionRequest(m.permission))
+  const unsubPermRes = vscode.onMessageFor("permissionResolved", (m) => handlePermissionResolved(m.permissionID))
+  const unsubPermErr = vscode.onMessageFor("permissionError", (m) => handlePermissionError(m.permissionID, m.stale))
+  onCleanup(() => {
+    unsubPermReq()
+    unsubPermRes()
+    unsubPermErr()
   })
-  onCleanup(unsubPermissions)
 
   // MCP status loaded from CLI backend
-  const unsubMcpStatus = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type === "mcpStatusLoaded") {
-      setMcpStatus(message.status)
-      setMcpLoading(null)
-    }
+  const unsubMcpStatus = vscode.onMessageFor("mcpStatusLoaded", (message) => {
+    setMcpStatus(message.status)
+    setMcpLoading(null)
   })
 
   // Request MCP status immediately; retry once on extensionDataReady if still missing.
@@ -712,8 +781,7 @@ export const SessionProvider: ParentComponent = (props) => {
     if (Object.keys(mcpStatus()).length === 0) vscode.postMessage({ type: "requestMcpStatus" })
   }, 3000)
 
-  const unsubReady = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "extensionDataReady") return
+  const unsubReady = vscode.onMessageFor("extensionDataReady", () => {
     unsubReady()
     clearTimeout(fallback)
     if (agents().length === 0) vscode.postMessage({ type: "requestAgents" })
@@ -755,8 +823,7 @@ export const SessionProvider: ParentComponent = (props) => {
   }
 
   // Load persisted variants from extension globalState
-  const unsubVariants = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "variantsLoaded") return
+  const unsubVariants = vscode.onMessageFor("variantsLoaded", (message) => {
     for (const [k, v] of Object.entries(message.variants)) {
       if (k.startsWith("session/")) continue
       setStore("variantSelections", k, v)
@@ -769,8 +836,7 @@ export const SessionProvider: ParentComponent = (props) => {
 
   // Load persisted per-mode model selections from model.json via extension host.
   // Uses replace semantics so a reset (empty payload) clears old entries.
-  const unsubSelections = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "modelSelectionsLoaded") return
+  const unsubSelections = vscode.onMessageFor("modelSelectionsLoaded", (message) => {
     setStore("modelSelections", reconcile(message.selections))
     const flags: Record<string, boolean> = {}
     for (const name of Object.keys(message.selections)) {
@@ -782,16 +848,14 @@ export const SessionProvider: ParentComponent = (props) => {
   onCleanup(unsubSelections)
 
   // Load persisted recent models from extension globalState
-  const unsubRecents = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "recentsLoaded") return
+  const unsubRecents = vscode.onMessageFor("recentsLoaded", (message) => {
     setStore("recentModels", message.recents)
   })
   vscode.postMessage({ type: "requestRecents" })
   onCleanup(unsubRecents)
 
   // Load persisted favorite models from extension globalState
-  const unsubFavorites = vscode.onMessage((message: ExtensionMessage) => {
-    if (message.type !== "favoritesLoaded") return
+  const unsubFavorites = vscode.onMessageFor("favoritesLoaded", (message) => {
     setStore("favoriteModels", message.favorites)
   })
   vscode.postMessage({ type: "requestFavorites" })
@@ -827,12 +891,71 @@ export const SessionProvider: ParentComponent = (props) => {
       return true
     }
 
+    if (message.type === "partTextAppend") {
+      // Compact wire format: only a textDelta, no full part snapshot.
+      // Drops the O(n²) IPC payload that the full part-snapshot form
+      // produced over a long streamed text or reasoning part. The
+      // scheduler only emits this once we've already bootstrapped the
+      // part on this side; if for any reason the part is no longer in
+      // the store/stash (session re-loaded), the merge no-ops and a
+      // subsequent full PartUpdate will resync the content.
+      handlePartTextAppend(message.sessionID, message.messageID, message.partID, message.textDelta)
+      return true
+    }
+
     if (message.type === "partRemoved") {
       handlePartRemoved(message.sessionID, message.messageID, message.partID)
       return true
     }
 
     return false
+  }
+
+  /** Apply a compact text-only delta against an already-bootstrapped part.
+   *  Quietly skips if the part isn't found — the scheduler only emits this
+   *  form for parts it has already sent in full, but that bootstrap can be
+   *  invalidated by drop()/messagesLoaded; recovery comes from the next
+   *  full PartUpdate carrying the part snapshot. */
+  function handlePartTextAppend(
+    sessionID: string,
+    messageID: string,
+    partID: string,
+    textDelta: string,
+  ) {
+    if (sessionID) patchPage(sessionID, { lastMutation: "update" })
+    if (messageID in store.parts) {
+      setStore(
+        "parts",
+        produce((parts) => {
+          const list = parts[messageID]
+          if (!list) return
+          const idx = list.findIndex((p) => p.id === partID)
+          if (idx < 0) return
+          const existing = list[idx]
+          if (existing && (existing.type === "text" || existing.type === "reasoning")) {
+            ;(existing as { text: string }).text += textDelta
+          }
+        }),
+      )
+      return
+    }
+    // Off-screen — apply directly to the stash, mirroring mergePartUpdate.
+    const stashed = stash.peek(messageID)
+    if (!stashed) return
+    const idx = stashed.findIndex((p) => p.id === partID)
+    if (idx < 0) return
+    const existing = stashed[idx]
+    if (existing.type !== "text" && existing.type !== "reasoning") return
+    const STASH_TEXT_CAP = 262_144
+    const target = existing as { text: string }
+    if (target.text.length >= STASH_TEXT_CAP) return
+    const next = target.text.length + textDelta.length
+    if (next > STASH_TEXT_CAP) {
+      const remaining = STASH_TEXT_CAP - target.text.length
+      target.text += textDelta.slice(0, remaining) + "\n… (truncated, hydrate to view full content)"
+    } else {
+      target.text += textDelta
+    }
   }
 
   function handleExtensionMessage(message: ExtensionMessage): void {
@@ -1097,6 +1220,33 @@ export const SessionProvider: ParentComponent = (props) => {
       return
     }
 
+    // Replace fast-path: re-entering a session that already has the same
+    // message list (same ids, same part counts) is the common case when the
+    // user tabs back-and-forth between two sessions. Same shape => same parts
+    // are already in either the reactive store or the stash, so the message
+    // overwrite + N stash.put calls are pure waste. Mark loaded and update
+    // pagination, then exit.
+    if (mode === "replace" && sameReconcileShape(store.messages[sessionID] ?? [], messages)) {
+      batch(() => {
+        setLoaded((prev) => {
+          if (prev.has(sessionID)) return prev
+          const next = new Set(prev)
+          next.add(sessionID)
+          return next
+        })
+        if (sessionID === currentSessionID()) setLoading(false)
+        setPages(sessionID, {
+          initialLoaded: true,
+          loadingInitial: false,
+          loadingOlder: false,
+          before: input.cursor,
+          hasMore: input.hasMore ?? Boolean(input.cursor),
+          lastMutation: mode,
+        })
+      })
+      return
+    }
+
     batch(() => {
       setLoaded((prev) => {
         if (prev.has(sessionID)) return prev
@@ -1157,6 +1307,10 @@ export const SessionProvider: ParentComponent = (props) => {
 
       for (const msg of messages) {
         if (!msg.parts || msg.parts.length === 0) continue
+        // Bulk-loaded parts won't trigger handlePartUpdated, so seed adjacency
+        // here. registerSessionEdge no-ops on duplicates and only bumps the
+        // family revision when a *new* edge appears.
+        registerEdgesFromParts(sessionID, msg.parts)
         if (mode === "reconcile" && store.parts[msg.id]) {
           // Reconcile on a message already hydrated into the reactive store:
           // write parts directly so visible turns pick up the server-
@@ -1230,6 +1384,28 @@ export const SessionProvider: ParentComponent = (props) => {
     if (message.parts && message.parts.length > 0) {
       stash.remove(message.id)
       setStore("parts", message.id, message.parts)
+      // Seed the parent→child adjacency from any task tool parts in this
+      // freshly created message. mergePartUpdate also calls registerSessionEdge
+      // for streamed updates, but the initial bulk parts arrive here.
+      registerEdgesFromParts(message.sessionID, message.parts)
+    }
+  }
+
+  /** Scan a part list for tool=task children and register the edges. Used
+   *  by handleMessageCreated and handleMessagesLoaded so the adjacency map
+   *  reflects history loaded outside the streaming path. */
+  function registerEdgesFromParts(parentSid: string, parts: Part[]): void {
+    for (const p of parts) {
+      if (p.type !== "tool") continue
+      const child = childID(
+        p as {
+          type: string
+          tool?: string
+          metadata?: { sessionId?: string }
+          state?: { metadata?: { sessionId?: string } }
+        },
+      )
+      if (child) registerSessionEdge(parentSid, child)
     }
   }
 
@@ -1248,6 +1424,23 @@ export const SessionProvider: ParentComponent = (props) => {
     }
 
     if (sessionID) patchPage(sessionID, { lastMutation: "update" })
+
+    // Maintain the parent→child adjacency map at ingest. The parent is the
+    // session that *owns this message* (sessionID arg), and the child (if
+    // any) is the task tool's metadata.sessionId. Doing this here means
+    // computeSessionFamily can be a pure cache lookup against `familyRev`
+    // instead of a full BFS subscribed to store.messages / store.parts.
+    if (sessionID && part.type === "tool") {
+      const child = childID(
+        part as {
+          type: string
+          tool?: string
+          metadata?: { sessionId?: string }
+          state?: { metadata?: { sessionId?: string } }
+        },
+      )
+      if (child) registerSessionEdge(sessionID, child)
+    }
 
     timed("handlePartUpdated", () => mergePartUpdate(effectiveMessageID, part, delta), { type: part.type })
   }
@@ -1310,7 +1503,21 @@ export const SessionProvider: ParentComponent = (props) => {
       delta.textDelta &&
       (existing.type === "text" || existing.type === "reasoning")
     ) {
-      ;(existing as { text: string }).text += delta.textDelta
+      // Cap accumulated text on stashed (off-screen) parts at 256 KB. Without
+      // this, a long-running off-screen tool output (e.g. multi-MB log)
+      // accumulates in the stash with no upper bound until the user scrolls
+      // to it. Hydration shows the cap; the user can refresh to fetch the
+      // full part on demand.
+      const STASH_TEXT_CAP = 262_144
+      const target = existing as { text: string }
+      const next = target.text.length + delta.textDelta.length
+      if (next > STASH_TEXT_CAP && target.text.length < STASH_TEXT_CAP) {
+        const remaining = STASH_TEXT_CAP - target.text.length
+        target.text += delta.textDelta.slice(0, remaining) + "\n… (truncated, hydrate to view full content)"
+      } else if (target.text.length < STASH_TEXT_CAP) {
+        target.text += delta.textDelta
+      }
+      // else: already truncated — drop the delta on the floor.
     } else {
       stashed[idx] = part
     }
@@ -1504,13 +1711,22 @@ export const SessionProvider: ParentComponent = (props) => {
   }
 
   /**
-   * BFS walk over message parts to discover all session IDs in a session's
-   * family tree (self + subagents + sub-subagents). Reads directly from the
-   * store so callers wrapped in createMemo automatically retrack when new
-   * messages or tool parts arrive. The plain function is kept private so
-   * sessionFamily()'s cached memo can wrap it.
+   * Walk the parent→child adjacency map to discover all session IDs in a
+   * session's family tree (self + subagents + sub-subagents).
+   *
+   * Previously this BFS read from store.messages / store.parts and got
+   * subscribed (via the wrapping createMemo) to thousands of reactive
+   * reads — every text-delta to any descendant re-ran the entire walk and
+   * cascaded into 5+ downstream memos. Now adjacency is maintained
+   * incrementally in handlePartUpdated / handleMessagesLoaded, the cache
+   * is keyed on `familyRev`, and the only reactive dep is that single
+   * counter signal. New child relationship → familyRev++ → memo re-runs;
+   * everything else is a no-op.
    */
   function computeSessionFamily(rootID: string): Set<string> {
+    const rev = familyRev()
+    const cached = familyCache.get(rootID)
+    if (cached && cached.rev === rev) return cached.v
     return timed(
       "sessionFamily",
       () => {
@@ -1518,29 +1734,15 @@ export const SessionProvider: ParentComponent = (props) => {
         const queue = [rootID]
         while (queue.length > 0) {
           const sid = queue.pop()!
-          const msgs = store.messages[sid]
-          if (!msgs) continue
-          for (const msg of msgs) {
-            const parts = store.parts[msg.id]
-            if (!parts) continue
-            for (const p of parts) {
-              if (p.type !== "tool") continue
-              // Webview ToolState omits runtime metadata; task parts still carry it from the backend.
-              const child = childID(
-                p as {
-                  type: string
-                  tool?: string
-                  metadata?: { sessionId?: string }
-                  state?: { metadata?: { sessionId?: string } }
-                },
-              )
-              if (child && !family.has(child)) {
-                family.add(child)
-                queue.push(child)
-              }
-            }
+          const kids = sessionChildren.get(sid)
+          if (!kids) continue
+          for (const c of kids) {
+            if (family.has(c)) continue
+            family.add(c)
+            queue.push(c)
           }
         }
+        familyCache.set(rootID, { v: family, rev })
         return family
       },
       { rootID },
@@ -1656,6 +1858,10 @@ export const SessionProvider: ParentComponent = (props) => {
       clearHiddenErrors(msgIds)
       // Free per-session reactive subscriptions for family/scoped derivations.
       disposeFamilyMemosFor(sessionID)
+      // Erase this session's parent→child adjacency entries so its memory
+      // doesn't outlive the deletion and so familyRev triggers downstream
+      // memos to refresh.
+      dropAdjacencyFor(sessionID)
 
       // Drop the loaded marker for this session. Without this, a server-
       // initiated delete leaves the ID in `loaded` forever — a small but
@@ -2256,7 +2462,13 @@ export const SessionProvider: ParentComponent = (props) => {
         toPark.push({ msgID: msg.id, parts: [...list] })
       }
     }
-    if (toPark.length === 0) return
+    if (toPark.length === 0) {
+      // Even when there's nothing to park, we still want to release the
+      // family/scoped reactive memos for this session so they don't stay
+      // subscribed to global signals across every other session visit.
+      for (const sid of family) disposeFamilyMemosFor(sid)
+      return
+    }
     batch(() => {
       setStore(
         "parts",
@@ -2266,6 +2478,12 @@ export const SessionProvider: ParentComponent = (props) => {
       )
     })
     for (const { msgID, parts } of toPark) stash.put(msgID, parts)
+    // Free the BFS + scoped memos for this session and any subagent in its
+    // family — they're created lazily in getFamilyMemo/scopedPermissions/etc
+    // on every session visit and, before this, only freed on session
+    // *deletion*. Without this, navigating between 50 sessions accumulated
+    // 50 detached Solid roots that re-ran BFS on every SSE batch.
+    for (const sid of family) disposeFamilyMemosFor(sid)
   }
 
   function selectSession(id: string) {
@@ -2464,7 +2682,14 @@ export const SessionProvider: ParentComponent = (props) => {
     return buildCostBreakdown(id, costs, familyLabels(), language.t("context.stats.thisSession"))
   })
 
-  // Status text derived from last assistant message parts
+  // Status text derived from last assistant message parts.
+  //
+  // The memo subscribes ONLY to fields computeStatus actually inspects
+  // (.type, .tool, .synthetic, and — only when synthetic — .text). This
+  // prevents streaming text-deltas to normal (non-synthetic) text parts
+  // from re-running the memo and cascading to TaskHeader / DockPrompt
+  // status surfaces. Without this gating, every text-delta invalidated
+  // statusText even though the produced label was identical.
   const statusText = createMemo<string | undefined>(() => {
     if (status() === "idle") return undefined
     const fallback = language.t("ui.sessionTurn.status.consideringNextSteps")
@@ -2474,7 +2699,14 @@ export const SessionProvider: ParentComponent = (props) => {
       if (msgs[i].role !== "assistant") continue
       const parts = getParts(msgs[i].id)
       if (parts.length === 0) break
-      const raw = computeStatus(parts[parts.length - 1], language.t) ?? fallback
+      const last = parts[parts.length - 1]
+      const type = last.type
+      const tool = (last as { tool?: string }).tool
+      const synthetic = (last as { synthetic?: boolean }).synthetic
+      // Only read .text when we know we'll inspect it (synthetic snapshot
+      // detection). Text-deltas to non-synthetic parts won't track here.
+      const text = synthetic && type === "text" ? (last as { text?: string }).text : undefined
+      const raw = computeStatus({ type, tool, synthetic, text } as unknown as Part, language.t) ?? fallback
       // When delegating to a subagent and that subagent is blocked on a prompt,
       // replace the generic "Delegating work" label with a more informative one
       // so the user understands why nothing appears to be happening.

@@ -40,13 +40,25 @@ interface ApplyPatchResult {
 interface ExecOptions {
   env?: NodeJS.ProcessEnv
   stdin?: string
+  /** Hard cap on combined stdout bytes. When exceeded, the child is killed
+   *  and the result is returned with `truncated: true` and stdout filled to
+   *  the cap. Use to defend against `git diff` / `git show` of multi-100 MB
+   *  blobs that would OOM the extension host (see audit D3 #3.1). */
+  maxStdoutBytes?: number
 }
 
 export interface ExecResult {
   code: number
   stdout: string
   stderr: string
+  /** True when the child was killed because output exceeded `maxStdoutBytes`.
+   *  stdout will be the captured prefix up to the cap. */
+  truncated?: boolean
 }
+
+/** Default cap: 100 MB. Most callers should pass a tighter cap appropriate
+ *  to the command (e.g. 4 MB for numstat, 200 KB for `--name-status`). */
+const DEFAULT_GIT_STDOUT_CAP = 100_000_000
 
 /**
  * Fixed SSH command injected by {@link nonInteractiveEnv} when the user has
@@ -528,7 +540,7 @@ export class GitOps {
    * suitable for callers that need to tolerate legitimate failures (e.g.
    * `merge-base` on an orphan branch, `ls-files --error-unmatch`).
    */
-  execGit(args: string[], cwd: string, options?: { stdin?: string }): Promise<ExecResult> {
+  execGit(args: string[], cwd: string, options?: { stdin?: string; maxStdoutBytes?: number }): Promise<ExecResult> {
     return this.exec(args, cwd, options)
   }
 
@@ -536,6 +548,7 @@ export class GitOps {
     if (this.controller.signal.aborted) {
       return Promise.resolve({ code: 1, stdout: "", stderr: "GitOps disposed" })
     }
+    const cap = options?.maxStdoutBytes ?? DEFAULT_GIT_STDOUT_CAP
     const invoke = () =>
       new Promise<ExecResult>((resolve) => {
         const child = spawn("git", args, {
@@ -555,7 +568,29 @@ export class GitOps {
 
         const out: Buffer[] = []
         const err: Buffer[] = []
-        child.stdout?.on("data", (chunk: Buffer) => out.push(chunk))
+        let outBytes = 0
+        let truncated = false
+        child.stdout?.on("data", (chunk: Buffer) => {
+          if (truncated) return
+          outBytes += chunk.length
+          if (outBytes > cap) {
+            // Kill the child and keep the prefix up to the cap. Without
+            // this guard, `git diff` against a 500-file refactor could
+            // emit 200 MB of patch text and Buffer.concat→toString below
+            // would materialize ~600 MB peak in the extension host.
+            const overflow = outBytes - cap
+            const keep = chunk.length - overflow
+            if (keep > 0) out.push(chunk.subarray(0, keep))
+            truncated = true
+            try {
+              child.kill()
+            } catch {
+              // child may already be dead
+            }
+            return
+          }
+          out.push(chunk)
+        })
         child.stderr?.on("data", (chunk: Buffer) => err.push(chunk))
 
         child.on("error", (error) => {
@@ -566,6 +601,7 @@ export class GitOps {
             code: code ?? 1,
             stdout: Buffer.concat(out).toString("utf8"),
             stderr: Buffer.concat(err).toString("utf8"),
+            ...(truncated ? { truncated: true } : {}),
           })
         })
       })

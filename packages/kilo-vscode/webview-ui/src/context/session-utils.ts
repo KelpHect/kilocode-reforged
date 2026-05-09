@@ -81,6 +81,21 @@ export function calcTotalCost(messages: Array<{ role: string; cost?: number }>):
 }
 
 /**
+ * Cache calcTotalCost results keyed on the messages-array reference. Solid's
+ * store preserves array identity when no structural change occurs, so re-sums
+ * during streaming-only updates are reduced to a single Map lookup. Cleared
+ * automatically by the GC when arrays go out of scope.
+ */
+const totalCostCache = new WeakMap<Array<{ role: string; cost?: number }>, number>()
+export function calcTotalCostCached(messages: Array<{ role: string; cost?: number }>): number {
+  const cached = totalCostCache.get(messages)
+  if (cached !== undefined) return cached
+  const v = calcTotalCost(messages)
+  totalCostCache.set(messages, v)
+  return v
+}
+
+/**
  * Calculate context usage percentage given token counts and a context limit.
  */
 export function calcContextUsage(
@@ -123,7 +138,7 @@ export function buildFamilyCosts(
   sessions: Record<string, { parentID?: string | null } | undefined>,
 ): Map<string, number> {
   const totals = new Map<string, number>()
-  for (const sid of family) totals.set(sid, calcTotalCost(messages[sid] ?? []))
+  for (const sid of family) totals.set(sid, calcTotalCostCached(messages[sid] ?? []))
 
   const own = new Map<string, number>(totals)
   for (const sid of family) {

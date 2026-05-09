@@ -5,6 +5,7 @@
  * This file is the style entrypoint for chat-related webview styles.
  */
 
+@import "./motion.css";
 @import "./task-header.css";
 @import "./chat-layout.css";
 @import "./banners.css";

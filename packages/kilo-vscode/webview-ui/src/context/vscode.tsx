@@ -30,7 +30,16 @@ export function getVSCodeAPI(): VSCodeAPI {
 // Context value type
 interface VSCodeContextValue {
   postMessage: (message: WebviewMessage) => void
+  /** Wildcard handler — receives every message. Prefer `onMessageFor` for new
+   *  call sites: the wildcard path runs every handler for every event, which
+   *  scaled poorly (38+ handlers × every SSE-driven `partUpdated`). */
   onMessage: (handler: (message: ExtensionMessage) => void) => () => void
+  /** Type-keyed handler — runs only when `message.type === type`. Drops the
+   *  per-event N-handler scan for hot streaming paths. */
+  onMessageFor: <T extends ExtensionMessage["type"]>(
+    type: T,
+    handler: (message: Extract<ExtensionMessage, { type: T }>) => void,
+  ) => () => void
   getState: <T>() => T | undefined
   setState: <T>(state: T) => void
 }
@@ -39,19 +48,28 @@ const VSCodeContext = createContext<VSCodeContextValue>()
 
 export const VSCodeProvider: ParentComponent = (props) => {
   const api = getVSCodeAPI()
-  const handlers = new Set<(message: ExtensionMessage) => void>()
+  // Wildcards still fan out to every registered handler — kept for migration
+  // ergonomics. Existing onMessage callers continue to work; new code should
+  // use onMessageFor to land in the byType bucket.
+  const wildcards = new Set<(message: ExtensionMessage) => void>()
+  const byType = new Map<string, Set<(message: ExtensionMessage) => void>>()
 
   // Listen for messages from the extension
   const messageListener = (event: MessageEvent) => {
     const message = event.data as ExtensionMessage
-    handlers.forEach((handler) => handler(message))
+    if (message && typeof message === "object" && "type" in message) {
+      const set = byType.get((message as { type: string }).type)
+      if (set) for (const h of set) h(message)
+    }
+    for (const h of wildcards) h(message)
   }
 
   window.addEventListener("message", messageListener)
 
   onCleanup(() => {
     window.removeEventListener("message", messageListener)
-    handlers.clear()
+    wildcards.clear()
+    byType.clear()
   })
 
   const value: VSCodeContextValue = {
@@ -59,8 +77,26 @@ export const VSCodeProvider: ParentComponent = (props) => {
       api.postMessage(message)
     },
     onMessage: (handler: (message: ExtensionMessage) => void) => {
-      handlers.add(handler)
-      return () => handlers.delete(handler)
+      wildcards.add(handler)
+      return () => wildcards.delete(handler)
+    },
+    onMessageFor: <T extends ExtensionMessage["type"]>(
+      type: T,
+      handler: (message: Extract<ExtensionMessage, { type: T }>) => void,
+    ) => {
+      let set = byType.get(type)
+      if (!set) {
+        set = new Set()
+        byType.set(type, set)
+      }
+      const wrapped = handler as (m: ExtensionMessage) => void
+      set.add(wrapped)
+      return () => {
+        const s = byType.get(type)
+        if (!s) return
+        s.delete(wrapped)
+        if (s.size === 0) byType.delete(type)
+      }
     },
     getState: <T,>() => api.getState() as T | undefined,
     setState: <T,>(state: T) => api.setState(state),

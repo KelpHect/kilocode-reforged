@@ -137,7 +137,10 @@
   justify-content: center;
   font-size: var(--kilo-font-size-16);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-  transition: background-color 0.2s;
+  transition: background-color var(--kilo-motion-fast, 120ms) ease;
+  /* Own compositor layer so the hover/press scale doesn't repaint anything else. */
+  transform: translateZ(0);
+  will-change: transform;
 }
 
 .scroll-to-bottom-button [data-component="icon"] {
@@ -146,6 +149,32 @@
 
 .scroll-to-bottom-button:hover {
   background: var(--vscode-button-hoverBackground);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .scroll-to-bottom-button {
+    animation: scroll-button-in var(--kilo-motion-fast, 140ms) var(--kilo-motion-ease-out, ease-out);
+    transition:
+      background-color var(--kilo-motion-fast, 120ms) ease,
+      transform var(--kilo-motion-fast, 120ms) ease;
+  }
+  .scroll-to-bottom-button:hover {
+    transform: translateZ(0) scale(1.06);
+  }
+  .scroll-to-bottom-button:active {
+    transform: translateZ(0) scale(0.94);
+  }
+}
+
+@keyframes scroll-button-in {
+  from {
+    opacity: 0;
+    transform: translateZ(0) scale(0.8);
+  }
+  to {
+    opacity: 1;
+    transform: translateZ(0) scale(1);
+  }
 }
 
 /* ============================================
@@ -173,6 +202,31 @@
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
   opacity: 0.7;
+}
+
+/* Subtle "breathing" animation on the indicator container so the user gets a
+   continuous signal that the agent is alive even when the spinner alone could
+   be missed. We animate `opacity` on the parent — text content inside the
+   indicator (status string, retry countdown) updates without restarting the
+   animation. The elapsed counter is counter-animated so it stays at constant
+   readability while the rest pulses. */
+@media (prefers-reduced-motion: no-preference) {
+  .working-indicator {
+    animation: working-breathe 2.4s ease-in-out infinite;
+  }
+  .working-indicator .working-elapsed {
+    animation: working-breathe-counter 2.4s ease-in-out infinite;
+  }
+}
+
+@keyframes working-breathe {
+  0%, 100% { opacity: 0.85; }
+  50%      { opacity: 1; }
+}
+
+@keyframes working-breathe-counter {
+  0%, 100% { opacity: 0.82; }
+  50%      { opacity: 0.7; }
 }
 
 /* ============================================

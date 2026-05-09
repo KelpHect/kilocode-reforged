@@ -84,6 +84,13 @@ export class KiloConnectionService {
    * Used primarily for message.part.updated where only messageID may be present.
    */
   private readonly messageSessionIdsByMessageId: Map<string, string> = new Map()
+  /**
+   * Inverse index — sessionId → set of messageIds that resolve to it. Maintained
+   * alongside `messageSessionIdsByMessageId` so `pruneSession` is O(messages-in-deleted-session)
+   * instead of O(messages-everywhere). Without this, a workspace with thousands of cached
+   * messages paid a full linear scan per session delete (and N² on bulk deletes).
+   */
+  private readonly messagesBySessionId: Map<string, Set<string>> = new Map()
 
   /** Provider key → single focused session ID. */
   private readonly focused: Map<string, string> = new Map()
@@ -214,35 +221,60 @@ export class KiloConnectionService {
 
   /**
    * Record a messageID -> sessionID mapping, typically from message.updated or from HTTP message history.
+   * Also maintains the inverse index so `pruneSession` doesn't scan globally.
    */
   recordMessageSessionId(messageId: string, sessionId: string): void {
     if (!messageId || !sessionId) {
       return
     }
+    const prev = this.messageSessionIdsByMessageId.get(messageId)
+    if (prev === sessionId) return
+    if (prev) {
+      this.messagesBySessionId.get(prev)?.delete(messageId)
+    }
     this.messageSessionIdsByMessageId.set(messageId, sessionId)
+    let set = this.messagesBySessionId.get(sessionId)
+    if (!set) {
+      set = new Set()
+      this.messagesBySessionId.set(sessionId, set)
+    }
+    set.add(messageId)
   }
 
   /**
    * Remove all messageID → sessionID entries for a given session.
    * Called when a session is deleted or otherwise pruned so the map
    * does not grow unbounded over the extension lifetime.
+   * O(messages-in-this-session) thanks to the inverse index.
    */
   pruneSession(sessionId: string): void {
-    for (const [mid, sid] of this.messageSessionIdsByMessageId) {
-      if (sid === sessionId) this.messageSessionIdsByMessageId.delete(mid)
-    }
+    const ids = this.messagesBySessionId.get(sessionId)
+    if (!ids) return
+    for (const mid of ids) this.messageSessionIdsByMessageId.delete(mid)
+    this.messagesBySessionId.delete(sessionId)
   }
+
+  /** Per-event resolution cache. Each Event object passes through ~4 listeners
+   *  (sidebar provider, AM, settings, autocomplete); the underlying resolver
+   *  walks the event payload + the messageId map. Caching by reference means
+   *  every consumer pays the work once per event instead of once per listener. */
+  private readonly resolvedEventSessionId = new WeakMap<Event, string | undefined>()
 
   /**
    * Best-effort sessionID extraction for an SSE event.
    * Returns undefined for global events.
+   * Cached against the event reference — same Event instance returns the same
+   * answer without re-walking the resolver.
    */
   resolveEventSessionId(event: Event): string | undefined {
-    return resolveEventSessionIdPure(
+    if (this.resolvedEventSessionId.has(event)) return this.resolvedEventSessionId.get(event)
+    const resolved = resolveEventSessionIdPure(
       event,
       (messageId) => this.messageSessionIdsByMessageId.get(messageId),
       (messageId, sessionId) => this.recordMessageSessionId(messageId, sessionId),
     )
+    this.resolvedEventSessionId.set(event, resolved)
+    return resolved
   }
 
   /**
@@ -475,21 +507,41 @@ export class KiloConnectionService {
   }
 
   /**
-   * Clean up everything: kill server, close SSE, clear listeners.
+   * Async-aware teardown. Closes SSE, awaits the server child-process exit
+   * (with a SIGTERM→SIGKILL race), then clears listeners. Call this from the
+   * extension's `deactivate()` so VS Code waits for the CLI to actually die.
+   */
+  async disposeAsync(): Promise<void> {
+    this.stopHealthPoll()
+    this.sseClient?.dispose()
+    await this.serverManager.disposeAsync()
+    this.clearListenerState()
+  }
+
+  /**
+   * Synchronous dispose — fire-and-forget shutdown. Prefer `disposeAsync()`
+   * from the extension's `deactivate()` so the process tree is gone before
+   * VS Code unloads the extension host.
    */
   dispose(): void {
     this.stopHealthPoll()
     this.sseClient?.dispose()
     this.serverManager.dispose()
+    this.clearListenerState()
+  }
+
+  private clearListenerState(): void {
     this.eventListeners.clear()
     this.stateListeners.clear()
     this.notificationDismissListeners.clear()
+    this.languageChangeListeners.clear()
     this.profileChangeListeners.clear()
     this.migrationCompleteListeners.clear()
     this.favoritesChangeListeners.clear()
     this.clearPendingPromptsListeners.clear()
     this.directoryProviders.clear()
     this.messageSessionIdsByMessageId.clear()
+    this.messagesBySessionId.clear()
     this.focused.clear()
     this.opened.clear()
     if (this.debounceTimer) {

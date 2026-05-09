@@ -228,24 +228,40 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }),
   )
 
-  // Seed prompt history from the current session's user messages (e.g., when a
-  // session is loaded that has existing conversation). Tracks userMessages()
-  // reactively so newly loaded sessions automatically contribute to history.
-  // Strip review-comment markdown prefix so only the user's draft is stored.
+  // Seed prompt history from the current session's user messages on
+  // session-switch only. Strip review-comment markdown prefix so only the
+  // user's draft is stored.
+  //
+  // The previous open `createEffect` tracked `session.userMessages()` AND
+  // (via `getParts(m.id)`) every user message's parts list. Any part mutation
+  // anywhere in the session — image-part hydration, redaction, optimistic
+  // clear, even an unrelated assistant text-delta touching the store — re-ran
+  // the full O(N×P) scan and rewrote `history`. With `on(currentSessionID,
+  // ...)` plus `untrack()` we run exactly once per session change. New user
+  // messages are appended via `history.append` in the submit path (below)
+  // so we don't need reactive re-seeding.
   const REVIEW_PREFIX = /^## Review Comments\n[\s\S]*?\n\n/
-  createEffect(() => {
-    const msgs = session.userMessages()
-    if (msgs.length === 0) return
-    const texts = msgs.map((m) => {
-      const parts = session.getParts(m.id)
-      const raw = parts
-        .filter((p): p is TextPart => p.type === "text")
-        .map((p) => p.text)
-        .join("")
-      return raw.replace(REVIEW_PREFIX, "")
-    })
-    history.seed(texts)
-  })
+  createEffect(
+    on(session.currentSessionID, (sid) => {
+      if (!sid) return
+      const msgs = untrack(() => session.userMessages())
+      if (msgs.length === 0) {
+        history.reset()
+        return
+      }
+      const texts = untrack(() =>
+        msgs.map((m) => {
+          const parts = session.getParts(m.id)
+          const raw = parts
+            .filter((p): p is TextPart => p.type === "text")
+            .map((p) => p.text)
+            .join("")
+          return raw.replace(REVIEW_PREFIX, "")
+        }),
+      )
+      history.seed(texts)
+    }),
+  )
 
   // Focus textarea when any part of the app requests it
   const onFocusPrompt = (event: Event) => {

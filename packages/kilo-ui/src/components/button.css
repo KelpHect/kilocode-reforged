@@ -23,6 +23,20 @@
     opacity: 0.8;
   }
 
+  /* Tactile press feedback. Compositor-only (transform); does not interact
+     with the existing opacity dim. Skipped under reduced-motion via the
+     global override (kilo-ui consumers are expected to ship motion.css). */
+  @media (prefers-reduced-motion: no-preference) {
+    transition:
+      background-color 120ms ease,
+      color 120ms ease,
+      transform 80ms ease-out;
+
+    &:active:not(:disabled) {
+      transform: scale(0.97);
+    }
+  }
+
   /* Full-width variant for "Start New Task" style buttons */
   &[data-full-width="true"] {
     width: 100%;

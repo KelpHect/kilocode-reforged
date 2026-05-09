@@ -69,7 +69,7 @@ function setup(active = false) {
     },
   }
 
-  registerCodeActions(context, provider as never, agent as never)
+  registerCodeActions(context, provider as never, () => agent as never)
 
   return { commands, events, executed, posts, waits }
 }

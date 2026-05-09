@@ -383,3 +383,22 @@
 [data-component="question-dock"][data-collapsed="true"] [data-slot="question-collapse-toggle"] {
   transform: rotate(180deg);
 }
+
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-component="question-dock"] {
+    animation: question-dock-rise var(--kilo-motion-base, 180ms) var(--kilo-motion-ease-out, ease-out);
+  }
+}
+
+@keyframes question-dock-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+

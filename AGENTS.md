@@ -107,6 +107,64 @@ Extension-specific settings should live in the Kilo extension settings, not defa
 - Rely on type inference unless explicit types improve exports or clarity.
 - Prefer short, clear names. Single-word names are good when they remain readable.
 
+## TypeScript Best Practices
+
+Curated rules — apply in code review and when authoring new code. References at the bottom.
+
+### Types & inference
+- **Annotate exported function signatures (params + return); let locals infer.** Public surface is a contract; locals lose nothing from inference.
+- **Annotate object literals at declaration, not via `as`.** `const cfg: Cfg = { ... }` catches missing/renamed fields; `{ ... } as Cfg` swallows them.
+- **Prefer narrowing via `typeof` / `instanceof` / `in` over assertions.** `if (x instanceof Foo) x.foo()` is checked at runtime; `(x as Foo).foo()` is not.
+- **Use `unknown`, never `{}` or `Object`, for opaque values.** `{}` accepts every non-nullish value; `unknown` forces a narrow.
+- **Use lowercase primitives (`string`/`number`/`boolean`).** Boxed `String`/`Number`/`Boolean` describe wrapper objects.
+
+### Type construction
+- **Default to `interface` for object shapes; reserve `type` for unions, tuples, mapped/conditional, and primitives.** Interfaces dedupe via merging and produce better errors.
+- **Extend interfaces instead of intersecting types.** `interface A extends B, C {}` is cached and conflict-detected; `type A = B & C` is recomputed and can silently produce `never`.
+- **Mark never-reassigned fields `readonly` and array params `readonly T[]`.** Documents intent and unblocks engine optimizations.
+- **Reach for `as const` for literal tuples and string-union sources.** `const ROLES = ['user','assistant'] as const` lets you derive `type Role = (typeof ROLES)[number]`.
+- **Forbid empty interfaces and unused generic params.** Both are lies about the API.
+- **Prefer plain `enum` (or `as const` objects) over `const enum`.** `const enum` breaks isolated-module builds.
+- **Avoid generics whose only use is in the return type.** Caller must supply `<X>` explicitly; otherwise inferred as `unknown`.
+- **Extract and name complex conditional/mapped types.** Inline conditionals are recomputed per instantiation; aliases get cached.
+
+### Null safety & runtime guards
+- **Use `field?: T`, never `field: T | undefined`, for optional properties.** Optional means "may be omitted"; explicit `| undefined` forces every consumer to pass `undefined`.
+- **Forbid the non-null assertion `!`.** Replace `user!.name` with `if (!user) return …`; `!` carries no runtime check and rots silently.
+- **Compare enum/number values explicitly, not via truthiness.** `state !== State.None`, not `if (state)` (the zero-th member is falsy). `== null` for combined null+undefined is the one allowed loose check.
+- **Use exhaustive `switch` on discriminated unions with a `never` default.** `default: const _: never = kind` makes adding a new variant a compile error everywhere.
+- **Validate every external boundary at runtime.** webview ↔ host messages, provider responses, file contents, SSE chunks — parse via zod / type predicate / explicit shape check before trusting the type.
+
+### Performance (compile- and run-time)
+- **Keep hot-path call sites monomorphic.** Don't pass mixed-shape objects through the same function on streaming/render/scroll paths. V8 deoptimizes polymorphic and megamorphic sites measurably.
+- **Initialize all object fields in the same order at construction; never assign later or `delete` them.** Reusing one hidden class keeps property access at fixed offsets; `delete` triggers a slow-property dictionary transition that's not reversible.
+- **Don't allocate closures, arrays, or option objects inside tight loops.** Hoist them; allocations dominate streaming render budgets.
+- **Use `import type { … }` for type-only imports.** Required for `isolatedModules`, eliminates the value at runtime, improves tree-shaking.
+- **Run independent async work with `Promise.all` (or `allSettled`); never serialize independent awaits.**
+- **Keep generics shallow and deeply-nested conditional types broken into named aliases.** Deep recursion blows up `tsc` memory.
+- **Strings: array-of-chunks + single `.join('')` for SSE delta accumulation, not `+=`.** Each `+=` builds a ConsString tree; subsequent `.length`/`.slice`/`.indexOf` flattens O(total length).
+- **Don't index into freshly-concatenated strings on hot paths.** `s[i]` / `.charCodeAt(i)` on a ConsString forces a flatten + full character copy.
+- **Pre-fill arrays via `Array.from({length:n}, () => 0)` or push-from-empty, not `new Array(n)`.** `new Array(n)` produces HOLEY elements that never transition back to PACKED.
+
+### API design / declarations
+- **Use `void` for callbacks whose return value is ignored.** `cb: () => void` documents that the result is discarded; never `() => any`.
+- **Declare callback parameters as required, not optional.** Callers may always omit trailing params; marking them `?` only confuses readers.
+- **Replace overload sets with optional params or unions.** Don't write three overloads that differ only by trailing args; use `(a: string, b?: string)` or `(a: number | string)`.
+- **When overloads are unavoidable, list specific signatures before general ones.** TS picks the first match.
+- **Co-locate runtime schemas with their types and derive the type from the schema.** `type X = z.infer<typeof XSchema>` keeps one source of truth.
+
+### Anti-patterns to reject in review
+- **Never `as any` or `as unknown as T`.** Both bypass the checker. Isolate genuine escape hatches in a single helper with a `// SAFETY:` comment.
+- **Never `@ts-ignore`; use `@ts-expect-error` with a reason.** `expect-error` becomes a build failure once the underlying error is fixed.
+- **Never use wrapper constructors `new String/Number/Boolean/Array/Object`.** They produce objects whose semantics surprise everyone (`new Boolean(false)` is truthy). Use literals + `String(x)`, `Number(x)`, `Boolean(x)`.
+- **Never use `Function` as a type.** Use a specific signature `(arg: T) => R`.
+- **Don't spread potentially-`undefined` into arrays/objects.** `[...maybe]` throws if undefined.
+- **Getters must be pure.** A getter that mutates, fetches, or logs surprises every consumer.
+
+### References
+
+Sources synthesized: [Google TS Style Guide](https://google.github.io/styleguide/tsguide.html), [TS Handbook Do's and Don'ts](https://www.typescriptlang.org/docs/handbook/declaration-files/do-s-and-don-ts.html), [TS Wiki Performance](https://github.com/microsoft/Typescript/wiki/Performance), [V8 hidden classes](https://v8.dev/blog/fast-properties), [V8 elements kinds](https://v8.dev/blog/elements-kinds), [V8 string internals](https://iliazeus.lol/articles/js-string-optimizations-en/), [Builder.io monomorphism](https://www.builder.io/blog/monomorphic-javascript), plus W3Schools / Codiga / AWS / Medium hot-path coverage.
+
 ## Testing
 
 - Avoid mocks when practical.

@@ -7,7 +7,7 @@
  * Call registerExpandedTaskTool() once at app startup to activate.
  */
 
-import { Component, createEffect, createMemo, For, Show } from "solid-js"
+import { Component, createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { ToolRegistry, ToolProps, getToolInfo } from "@kilocode/kilo-ui/message-part"
 import { BasicTool } from "@kilocode/kilo-ui/basic-tool"
 import { Icon } from "@kilocode/kilo-ui/icon"
@@ -124,28 +124,55 @@ const TaskToolRenderer: Component<ToolProps> = (props) => {
                 <span data-slot="task-tool-title">{language.t("session.messages.taskStarting")}</span>
               </div>
             </Show>
-            <For each={childToolParts()}>
-              {(item) => {
-                const info = createMemo(() => getToolInfo(item.tool, item.state?.input))
-                const subtitle = createMemo(() => {
-                  if (info().subtitle) return info().subtitle
-                  const state = item.state as { status: string; title?: string }
-                  if (state.status === "completed" || state.status === "running") {
-                    return state.title
-                  }
-                  return undefined
-                })
-                return (
-                  <div data-slot="task-tool-item">
-                    <Icon name={info().icon} size="small" />
-                    <span data-slot="task-tool-title">{info().title}</span>
-                    <Show when={subtitle()}>
-                      <span data-slot="task-tool-subtitle">{subtitle()}</span>
-                    </Show>
-                  </div>
-                )
-              }}
-            </For>
+            {/* Sub-agent task tools commonly produce 200+ child tool calls.
+                Rendering them all flat blew layout time; cap visible count
+                and reveal the rest behind an explicit toggle. The visible
+                slice still scrolls within autoScroll.scrollRef. */}
+            {(() => {
+              const TASK_CHILD_LIMIT = 30
+              const [showAll, setShowAll] = createSignal(false)
+              const visible = createMemo(() => {
+                const all = childToolParts()
+                if (showAll() || all.length <= TASK_CHILD_LIMIT) return all
+                return all.slice(0, TASK_CHILD_LIMIT)
+              })
+              const hidden = createMemo(() => Math.max(0, childToolParts().length - visible().length))
+              return (
+                <>
+                  <For each={visible()}>
+                    {(item) => {
+                      const info = createMemo(() => getToolInfo(item.tool, item.state?.input))
+                      const subtitle = createMemo(() => {
+                        if (info().subtitle) return info().subtitle
+                        const state = item.state as { status: string; title?: string }
+                        if (state.status === "completed" || state.status === "running") {
+                          return state.title
+                        }
+                        return undefined
+                      })
+                      return (
+                        <div data-slot="task-tool-item">
+                          <Icon name={info().icon} size="small" />
+                          <span data-slot="task-tool-title">{info().title}</span>
+                          <Show when={subtitle()}>
+                            <span data-slot="task-tool-subtitle">{subtitle()}</span>
+                          </Show>
+                        </div>
+                      )
+                    }}
+                  </For>
+                  <Show when={hidden() > 0}>
+                    <button
+                      data-slot="task-tool-show-more"
+                      type="button"
+                      onClick={() => setShowAll(true)}
+                    >
+                      {`+ ${hidden()} more`}
+                    </button>
+                  </Show>
+                </>
+              )
+            })()}
           </div>
         </div>
       </BasicTool>

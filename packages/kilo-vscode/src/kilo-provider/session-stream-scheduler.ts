@@ -9,8 +9,8 @@
  * See the tuning comment on the default constants below for rationale.
  */
 
-import type { PartBatch, PartUpdate } from "../shared/stream-messages"
-export type { PartBatch, PartUpdate } from "../shared/stream-messages"
+import type { PartBatch, PartTextAppend, PartUpdate } from "../shared/stream-messages"
+export type { PartBatch, PartTextAppend, PartUpdate } from "../shared/stream-messages"
 
 export type StreamSchedulerStats = {
   received: number
@@ -113,6 +113,12 @@ export class SessionStreamScheduler {
   private btimer: ReturnType<typeof setTimeout> | null = null
   private bgFirstQueuedAt = 0
   private readonly queues = new Map<string, Map<string, PartUpdate>>()
+  // Per-key flag: have we already emitted a full PartUpdate for this part?
+  // Once we have, subsequent text-only deltas can be sent as the compact
+  // PartTextAppend wire format — drops the O(n²) bytes of accumulated text
+  // from the IPC payload on long streamed messages. Cleared when the
+  // session is dropped / the provider disposes.
+  private readonly bootstrapped = new Map<string, Set<string>>()
   private readonly activeMs: number
   private readonly bgBase: number
   private readonly bgStep: number
@@ -126,7 +132,7 @@ export class SessionStreamScheduler {
   }
 
   constructor(
-    private readonly send: (msg: PartUpdate | PartBatch) => void,
+    private readonly send: (msg: PartUpdate | PartBatch | PartTextAppend) => void,
     opts?: StreamSchedulerOptions,
   ) {
     this.activeMs = opts?.activeMs ?? DEFAULT_ACTIVE_MS
@@ -200,6 +206,10 @@ export class SessionStreamScheduler {
    */
   drop(sessionID: string): void {
     this.queues.delete(sessionID)
+    // Forget which parts we've bootstrapped for this session — after a drop
+    // (or messagesLoaded snapshot replace) the webview's view of the session
+    // resets, so the next part-update must be a full PartUpdate.
+    this.bootstrapped.delete(sessionID)
     if (this.btimer && !this.hasBackground()) {
       clearTimeout(this.btimer)
       this.btimer = null
@@ -209,6 +219,7 @@ export class SessionStreamScheduler {
   dispose(): void {
     this.clearTimers()
     this.queues.clear()
+    this.bootstrapped.clear()
   }
 
   stats(): Readonly<StreamSchedulerStats> {
@@ -300,17 +311,79 @@ export class SessionStreamScheduler {
       this.emitOne(updates[0]!)
       return
     }
+    // For batches, decide per-update whether the wire form can be the compact
+    // PartTextAppend or must be a full PartUpdate. The webview adapter
+    // dispatches both forms by message type so mixing them in a single
+    // PartBatch isn't useful — instead, peel off any compact-able entries
+    // and emit them inline before the remaining batch.
     this.counters.emitted += updates.length
     this.counters.batches++
     this.countLane(updates[0]!.sessionID)
-    this.send({ type: "partsUpdated", updates })
+    const remaining: PartUpdate[] = []
+    for (const u of updates) {
+      const compact = this.toCompactAppend(u)
+      if (compact) {
+        this.send(compact)
+      } else {
+        remaining.push(u)
+        this.markBootstrapped(u)
+      }
+    }
+    if (remaining.length > 0) this.send({ type: "partsUpdated", updates: remaining })
   }
 
   private emitOne(msg: PartUpdate): void {
     this.counters.emitted++
     this.counters.batches++
     this.countLane(msg.sessionID)
+    const compact = this.toCompactAppend(msg)
+    if (compact) {
+      this.send(compact)
+      return
+    }
+    this.markBootstrapped(msg)
     this.send(msg)
+  }
+
+  /** Build the bootstrap-tracking key. Same shape as partUpdateKey so two
+   *  parts with the same id in different messages don't get conflated —
+   *  webview part lookups are keyed by (messageID, partID), so the bootstrap
+   *  tracking must match. */
+  private bootstrapKey(sessionID: string, messageID: string | undefined, partID: string): string {
+    const mid = messageID ?? ""
+    return `${sessionID}:${mid}:${partID}`
+  }
+
+  /** Return a compact PartTextAppend if this update is a pure text append
+   *  to a part the webview has already received. Otherwise undefined.
+   *  The caller should send the full PartUpdate and call `markBootstrapped`. */
+  private toCompactAppend(msg: PartUpdate): PartTextAppend | undefined {
+    const text = msg.delta?.textDelta
+    if (!text || msg.delta?.type !== "text-delta") return undefined
+    const partID = partField(msg.part, "id")
+    if (typeof partID !== "string" || !partID) return undefined
+    const session = this.bootstrapped.get(msg.sessionID)
+    if (!session?.has(this.bootstrapKey(msg.sessionID, msg.messageID, partID))) return undefined
+    return {
+      type: "partTextAppend",
+      sessionID: msg.sessionID,
+      messageID: msg.messageID,
+      partID,
+      textDelta: text,
+    }
+  }
+
+  /** Record that the webview has now seen this part — subsequent text-only
+   *  deltas for the same (messageID, id) can be sent as PartTextAppend. */
+  private markBootstrapped(msg: PartUpdate): void {
+    const partID = partField(msg.part, "id")
+    if (typeof partID !== "string" || !partID) return
+    let session = this.bootstrapped.get(msg.sessionID)
+    if (!session) {
+      session = new Set<string>()
+      this.bootstrapped.set(msg.sessionID, session)
+    }
+    session.add(this.bootstrapKey(msg.sessionID, msg.messageID, partID))
   }
 
   private countLane(sessionID: string): void {

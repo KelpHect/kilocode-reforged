@@ -1,6 +1,6 @@
 import type { ProviderAuthAuthorization, ProviderAuthMethod } from "@kilocode/sdk/v2/client"
 import type { DiffSourceCapabilities, DiffSourceDescriptor } from "../../../../src/diff/sources/types"
-import type { PartBatch, PartRemove, PartUpdate } from "../../../../src/shared/stream-messages"
+import type { PartBatch, PartRemove, PartTextAppend, PartUpdate } from "../../../../src/shared/stream-messages"
 import type { SessionMode } from "../../context/worktree-mode"
 import type { MarketplaceItem, MarketplaceInstalledMetadata } from "../marketplace"
 import type { ConnectionState, ServerInfo, SessionStatus } from "./connection"
@@ -101,6 +101,7 @@ export interface SendMessageFailedMessage {
 export type PartUpdatedMessage = PartUpdate<Part>
 export type PartsUpdatedMessage = PartBatch<Part>
 export type PartRemovedMessage = PartRemove
+export type PartTextAppendMessage = PartTextAppend
 
 export interface SessionStatusMessage {
   type: "sessionStatus"
@@ -891,6 +892,7 @@ export type ExtensionMessage =
   | PartUpdatedMessage
   | PartsUpdatedMessage
   | PartRemovedMessage
+  | PartTextAppendMessage
   | SessionStatusMessage
   | SessionErrorMessage
   | PermissionRequestMessage

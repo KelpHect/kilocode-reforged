@@ -175,6 +175,21 @@ export class SessionTerminalManager {
   }
 
   /**
+   * Drop the terminal owned by a deleted session. Without this, the
+   * Map<sessionId, terminal> kept terminal handles alive even after the
+   * session was deleted server-side, accumulating one orphan terminal per
+   * deleted-but-still-running terminal until panel teardown.
+   */
+  removeSession(sessionId: string): void {
+    const entry = this.terminals.get(sessionId)
+    if (!entry) return
+    entry.terminal.dispose()
+    this.terminals.delete(sessionId)
+    this.log(`removeSession: disposed terminal for session ${sessionId}`)
+    this.updateContextKey()
+  }
+
+  /**
    * Check if a session has an active terminal.
    */
   hasTerminal(sessionId: string): boolean {

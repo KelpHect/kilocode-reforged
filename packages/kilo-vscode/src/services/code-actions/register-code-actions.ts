@@ -7,9 +7,14 @@ import { createPrompt } from "./support-prompt"
 export function registerCodeActions(
   context: vscode.ExtensionContext,
   provider: KiloProvider,
-  agentManager?: AgentManagerProvider,
+  /** Getter so the AgentManagerProvider can be lazy-constructed at activation
+   *  time and only resolved when a code-action command actually fires. */
+  getAgentManager?: () => AgentManagerProvider | undefined,
 ): void {
-  const target = () => (agentManager?.isActive() ? agentManager : provider)
+  const target = () => {
+    const am = getAgentManager?.()
+    return am?.isActive() ? am : provider
+  }
   const reveal = async () => {
     await vscode.commands.executeCommand("kilo-code.SidebarProvider.focus")
     await provider.waitForReady()
