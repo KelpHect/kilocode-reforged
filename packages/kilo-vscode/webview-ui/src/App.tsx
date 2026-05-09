@@ -107,6 +107,7 @@ export const DataBridge: ParentComponent = (props) => {
     all: Object.values(prov.providers()) as unknown as SDKProvider[],
     connected: prov.connected(),
     default: prov.defaults(),
+    failed: [],
   }))
 
   // Stable object with reactive getters — passes through to Solid stores so

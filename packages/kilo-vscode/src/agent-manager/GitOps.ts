@@ -69,14 +69,6 @@ const DEFAULT_GIT_STDOUT_CAP = 100_000_000
 export const KILO_NON_INTERACTIVE_SSH_COMMAND = "ssh -o BatchMode=yes"
 
 /**
- * Fixed SSH command injected by {@link nonInteractiveEnv} when the user has
- * not already configured their own. Exported so callers can check whether a
- * `GIT_SSH_COMMAND` originated from Kilo (safe) or was inherited from the
- * parent process (untrusted).
- */
-export const KILO_NON_INTERACTIVE_SSH_COMMAND = "ssh -o BatchMode=yes"
-
-/**
  * Build environment variables that prevent git and SSH from opening interactive
  * prompts. Used for background operations (e.g. periodic fetch) so users with
  * SSH keys that require passphrase confirmation are not bombarded with dialogs.

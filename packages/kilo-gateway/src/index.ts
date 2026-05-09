@@ -42,13 +42,6 @@ export {
 } from "./api/embedding-models.js"
 export { resolveKiloGatewayBaseUrl, resolveKiloOpenRouterBaseUrl } from "./api/url.js"
 export {
-  EMPTY_KILO_EMBEDDING_MODEL_CATALOG,
-  fetchKiloEmbeddingModelCatalog,
-  type KiloEmbeddingModel,
-  type KiloEmbeddingModelCatalog,
-} from "./api/embedding-models.js"
-export { resolveKiloGatewayBaseUrl, resolveKiloOpenRouterBaseUrl } from "./api/url.js"
-export {
   fetchOrganizationModes,
   clearModesCache,
   type OrganizationMode,
