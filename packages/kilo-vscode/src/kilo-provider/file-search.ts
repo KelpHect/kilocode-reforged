@@ -4,13 +4,13 @@ import type { KiloClient } from "@kilocode/sdk/v2/client"
 import { mergeFileSearchResults } from "./file-search-results"
 import { mergeFileSearchItems } from "./file-search-items"
 
-type Message = {
+interface Message {
   query: string
   requestId: string
   sessionID?: string
 }
 
-type Input = {
+interface Input {
   client: KiloClient | null
   message: Message
   current?: string

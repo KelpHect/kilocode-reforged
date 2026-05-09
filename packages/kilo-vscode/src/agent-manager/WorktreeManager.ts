@@ -373,8 +373,11 @@ export class WorktreeManager {
 
   private async removeWorktreeImpl(worktreePath: string, branch?: string): Promise<void> {
     if (!fs.existsSync(worktreePath)) {
-      // Directory already gone — just prune stale metadata
-      await this.git.raw(["worktree", "prune", "--expire", "now"]).catch(() => {})
+      // Directory already gone — just prune stale metadata. Best-effort:
+      // a prune failure isn't fatal here since the directory is already gone.
+      await this.git.raw(["worktree", "prune", "--expire", "now"]).catch((err) => {
+        this.log(`Prune (already-absent path) failed: ${err}`)
+      })
       this.log(`Worktree directory already absent, pruned metadata: ${worktreePath}`)
       if (branch) await this.deleteBranch(branch)
       return
@@ -391,15 +394,23 @@ export class WorktreeManager {
     try {
       await fs.promises.rename(worktreePath, temp)
     } catch {
-      // Rename failed (e.g. locked files on Windows) — fall back to force remove
+      // Rename failed (e.g. locked files on Windows) — fall back to force remove.
+      // Force-remove is itself best-effort; surface failures so a stuck worktree
+      // doesn't disappear from logs entirely.
       this.log(`Rename failed, falling back to force remove: ${worktreePath}`)
-      await this.git.raw(["worktree", "remove", "--force", worktreePath]).catch(() => {})
+      await this.git.raw(["worktree", "remove", "--force", worktreePath]).catch((err) => {
+        this.log(`Force-remove fallback failed for ${worktreePath}: ${err}`)
+      })
       if (branch) await this.deleteBranch(branch)
       return
     }
 
-    // 2. Prune git metadata now that the directory is gone from the expected path
-    await this.git.raw(["worktree", "prune", "--expire", "now"]).catch(() => {})
+    // 2. Prune git metadata now that the directory is gone from the expected path.
+    //    Prune is best-effort; the directory is already moved aside so failure
+    //    only leaves stale .git/worktrees metadata that the next prune cleans up.
+    await this.git.raw(["worktree", "prune", "--expire", "now"]).catch((err) => {
+      this.log(`Prune (post-rename) failed for ${worktreePath}: ${err}`)
+    })
     this.log(`Removed worktree (rename+prune): ${worktreePath}`)
 
     // 3. Delete the local branch while we still hold the git lock
@@ -435,7 +446,9 @@ export class WorktreeManager {
           }
         }
       })
-      .catch(() => {})
+      .catch((err) => {
+        this.log(`Failed to read worktrees dir for orphan cleanup ${this.dir}: ${err}`)
+      })
   }
 
   async discoverWorktrees(): Promise<WorktreeInfo[]> {

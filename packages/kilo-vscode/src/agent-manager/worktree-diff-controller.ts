@@ -11,7 +11,11 @@ import type { AgentManagerOutMessage, WorktreeDiffEntry } from "./types"
 
 const LOCAL_DIFF_ID = "local" as const
 
-type Target = { sessionId: string; directory: string; baseBranch: string }
+interface Target {
+  sessionId: string
+  directory: string
+  baseBranch: string
+}
 
 type AgentManagerDiffFile = DiffFile & WorktreeDiffEntry
 

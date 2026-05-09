@@ -52,6 +52,8 @@ import {
   buildFamilyLabels,
   buildCostBreakdown,
   childID,
+  arraysShallowEqual,
+  setsEqual,
 } from "./session-utils"
 import { Identifier } from "../utils/id"
 import { resolveModelSelection } from "./model-selection"
@@ -518,7 +520,9 @@ export const SessionProvider: ParentComponent = (props) => {
     return selectedAgentName()
   }
 
-  const agentNames = createMemo(() => new Set(agents().map((agent) => agent.name)))
+  const agentNames = createMemo<Set<string>>(() => new Set(agents().map((agent) => agent.name)), new Set<string>(), {
+    equals: setsEqual,
+  })
 
   /** Per-mode model from config (e.g. config.agent.code.model). */
   function getModeModel(agentName: string): ModelSelection | null {
@@ -911,51 +915,158 @@ export const SessionProvider: ParentComponent = (props) => {
     return false
   }
 
+  /**
+   * Microtask-batched text-delta accumulator.
+   *
+   * Per AGENTS.md "Strings: array-of-chunks + single .join('') for SSE delta
+   * accumulation". Each `+=` creates a ConsString cons-node; subsequent
+   * char-access operations (e.g. `marked.parse(text)` at render time) flatten
+   * the tree at O(total) cost. With 100-200 deltas/sec a single message can
+   * accumulate a 200-deep ConsString within seconds, and every render flattens
+   * the whole tree.
+   *
+   * Strategy: queue all deltas in a Map<key, chunks[]> within a tick; flush at
+   * next microtask via a single `setStore` + `produce` that joins chunks per
+   * part and applies one `+=` per part. For 50 deltas in one tick this turns
+   * 50 cons-nodes per part into 1 cons-node per part — depth bounded by
+   * the worst-case "deltas-per-tick", typically <10.
+   *
+   * Ordering with non-delta `partUpdate` (full snapshot) is preserved by
+   * `dropPendingDeltasFor` — when a snapshot arrives for a part with pending
+   * deltas, the deltas are dropped (the snapshot subsumes them).
+   */
+  interface PendingDeltaEntry {
+    sessionID: string | undefined
+    chunks: string[]
+  }
+  const pendingTextDeltas = new Map<string, PendingDeltaEntry>()
+  let textDeltaFlushScheduled = false
+
+  function pendingDeltaKey(messageID: string, partID: string): string {
+    return `${messageID} ${partID}`
+  }
+
+  function enqueueTextDelta(
+    sessionID: string | undefined,
+    messageID: string,
+    partID: string,
+    textDelta: string,
+  ): void {
+    const key = pendingDeltaKey(messageID, partID)
+    const entry = pendingTextDeltas.get(key)
+    if (entry) {
+      entry.chunks.push(textDelta)
+    } else {
+      pendingTextDeltas.set(key, { sessionID, chunks: [textDelta] })
+    }
+    if (!textDeltaFlushScheduled) {
+      textDeltaFlushScheduled = true
+      queueMicrotask(flushTextDeltas)
+    }
+  }
+
+  function dropPendingDeltasFor(messageID: string, partID: string): void {
+    pendingTextDeltas.delete(pendingDeltaKey(messageID, partID))
+  }
+
+  function dropPendingDeltasForMessage(messageID: string): void {
+    const prefix = `${messageID} `
+    for (const key of pendingTextDeltas.keys()) {
+      if (key.startsWith(prefix)) pendingTextDeltas.delete(key)
+    }
+  }
+
+  function flushTextDeltas(): void {
+    textDeltaFlushScheduled = false
+    if (pendingTextDeltas.size === 0) return
+
+    interface FlushItem {
+      messageID: string
+      partID: string
+      sessionID: string | undefined
+      joined: string
+    }
+    const storeBatch: FlushItem[] = []
+    const stashBatch: FlushItem[] = []
+
+    for (const [key, entry] of pendingTextDeltas) {
+      const sep = key.indexOf(" ")
+      if (sep < 0) continue
+      const messageID = key.slice(0, sep)
+      const partID = key.slice(sep + 1)
+      const joined = entry.chunks.length === 1 ? entry.chunks[0] : entry.chunks.join("")
+      const item: FlushItem = { messageID, partID, sessionID: entry.sessionID, joined }
+      if (messageID in store.parts) storeBatch.push(item)
+      else stashBatch.push(item)
+    }
+    pendingTextDeltas.clear()
+
+    // Apply all hydrated-store updates in a single setStore + produce.
+    if (storeBatch.length > 0) {
+      setStore(
+        "parts",
+        produce((parts) => {
+          for (let i = 0; i < storeBatch.length; i++) {
+            const { messageID, partID, joined } = storeBatch[i]
+            const list = parts[messageID]
+            if (!list) continue
+            const idx = list.findIndex((p) => p.id === partID)
+            if (idx < 0) continue
+            const existing = list[idx]
+            if (existing && (existing.type === "text" || existing.type === "reasoning")) {
+              ;(existing as { text: string }).text += joined
+            }
+          }
+        }),
+      )
+      // Mirror lastMutation patching for each affected session — coalesced so
+      // a session with 20 parts updating in this tick patches once.
+      const seen = new Set<string>()
+      for (let i = 0; i < storeBatch.length; i++) {
+        const sid = storeBatch[i].sessionID
+        if (!sid || seen.has(sid)) continue
+        seen.add(sid)
+        patchPage(sid, { lastMutation: "update" })
+      }
+    }
+
+    // Stash updates respect the off-screen text cap; can't be batched into
+    // setStore/produce because the stash is a side-store, not reactive.
+    for (let i = 0; i < stashBatch.length; i++) {
+      const { messageID, partID, joined } = stashBatch[i]
+      const stashed = stash.peek(messageID)
+      if (!stashed) continue
+      const idx = stashed.findIndex((p) => p.id === partID)
+      if (idx < 0) continue
+      const existing = stashed[idx]
+      if (existing.type !== "text" && existing.type !== "reasoning") continue
+      const target = existing as { text: string }
+      if (target.text.length >= STASH_TEXT_CAP) continue
+      const next = target.text.length + joined.length
+      if (next > STASH_TEXT_CAP) {
+        const remaining = STASH_TEXT_CAP - target.text.length
+        target.text += joined.slice(0, remaining) + "\n… (truncated, hydrate to view full content)"
+      } else {
+        target.text += joined
+      }
+    }
+  }
+
+  /**
+   * Cap for off-screen accumulated text. Without this, a long-running
+   * off-screen tool output (e.g. multi-MB log) accumulates in the stash with
+   * no upper bound until the user scrolls to it. Hydration shows the cap;
+   * the user can refresh to fetch the full part on demand.
+   */
+  const STASH_TEXT_CAP = 262_144
+
   /** Apply a compact text-only delta against an already-bootstrapped part.
    *  Quietly skips if the part isn't found — the scheduler only emits this
    *  form for parts it has already sent in full, but that bootstrap can be
    *  invalidated by drop()/messagesLoaded; recovery comes from the next
    *  full PartUpdate carrying the part snapshot. */
-  function handlePartTextAppend(
-    sessionID: string,
-    messageID: string,
-    partID: string,
-    textDelta: string,
-  ) {
-    if (sessionID) patchPage(sessionID, { lastMutation: "update" })
-    if (messageID in store.parts) {
-      setStore(
-        "parts",
-        produce((parts) => {
-          const list = parts[messageID]
-          if (!list) return
-          const idx = list.findIndex((p) => p.id === partID)
-          if (idx < 0) return
-          const existing = list[idx]
-          if (existing && (existing.type === "text" || existing.type === "reasoning")) {
-            ;(existing as { text: string }).text += textDelta
-          }
-        }),
-      )
-      return
-    }
-    // Off-screen — apply directly to the stash, mirroring mergePartUpdate.
-    const stashed = stash.peek(messageID)
-    if (!stashed) return
-    const idx = stashed.findIndex((p) => p.id === partID)
-    if (idx < 0) return
-    const existing = stashed[idx]
-    if (existing.type !== "text" && existing.type !== "reasoning") return
-    const STASH_TEXT_CAP = 262_144
-    const target = existing as { text: string }
-    if (target.text.length >= STASH_TEXT_CAP) return
-    const next = target.text.length + textDelta.length
-    if (next > STASH_TEXT_CAP) {
-      const remaining = STASH_TEXT_CAP - target.text.length
-      target.text += textDelta.slice(0, remaining) + "\n… (truncated, hydrate to view full content)"
-    } else {
-      target.text += textDelta
-    }
+  function handlePartTextAppend(sessionID: string, messageID: string, partID: string, textDelta: string) {
+    enqueueTextDelta(sessionID || undefined, messageID, partID, textDelta)
   }
 
   function handleExtensionMessage(message: ExtensionMessage): void {
@@ -1453,6 +1564,31 @@ export const SessionProvider: ParentComponent = (props) => {
     // message's key in store.parts. While off-screen we keep the parts in
     // the stash so streaming SSE deltas don't create reactive proxies for
     // content nobody is rendering. The drain happens in hydrateParts().
+
+    // Pure text-delta against an existing part → enqueue for microtask flush
+    // (see flushTextDeltas). This collapses N deltas-per-tick into a single
+    // `+=` so ConsString depth stays bounded by deltas-per-microtask, not
+    // by total deltas-since-last-render.
+    if (
+      delta?.type === "text-delta" &&
+      delta.textDelta &&
+      (part.type === "text" || part.type === "reasoning")
+    ) {
+      const present = effectiveMessageID in store.parts
+        ? store.parts[effectiveMessageID]?.some((p) => p.id === part.id)
+        : stash.peek(effectiveMessageID)?.some((p) => p.id === part.id)
+      if (present) {
+        enqueueTextDelta(undefined, effectiveMessageID, part.id, delta.textDelta)
+        return
+      }
+      // Part not yet present — fall through so the snapshot is inserted now.
+    }
+
+    // Non-delta path: a full snapshot supersedes any pending deltas for this
+    // part (their content is included in `part.text`). Drop them so the
+    // microtask flush doesn't double-apply.
+    dropPendingDeltasFor(effectiveMessageID, part.id)
+
     if (effectiveMessageID in store.parts) {
       setStore(
         "parts",
@@ -1469,16 +1605,7 @@ export const SessionProvider: ParentComponent = (props) => {
             list.push(part)
             return
           }
-          const existing = list[idx]
-          if (
-            delta?.type === "text-delta" &&
-            delta.textDelta &&
-            (existing.type === "text" || existing.type === "reasoning")
-          ) {
-            ;(existing as { text: string }).text += delta.textDelta
-          } else {
-            list[idx] = part
-          }
+          list[idx] = part
         }),
       )
       return
@@ -1497,34 +1624,16 @@ export const SessionProvider: ParentComponent = (props) => {
       stashed.push(part)
       return
     }
-    const existing = stashed[idx]
-    if (
-      delta?.type === "text-delta" &&
-      delta.textDelta &&
-      (existing.type === "text" || existing.type === "reasoning")
-    ) {
-      // Cap accumulated text on stashed (off-screen) parts at 256 KB. Without
-      // this, a long-running off-screen tool output (e.g. multi-MB log)
-      // accumulates in the stash with no upper bound until the user scrolls
-      // to it. Hydration shows the cap; the user can refresh to fetch the
-      // full part on demand.
-      const STASH_TEXT_CAP = 262_144
-      const target = existing as { text: string }
-      const next = target.text.length + delta.textDelta.length
-      if (next > STASH_TEXT_CAP && target.text.length < STASH_TEXT_CAP) {
-        const remaining = STASH_TEXT_CAP - target.text.length
-        target.text += delta.textDelta.slice(0, remaining) + "\n… (truncated, hydrate to view full content)"
-      } else if (target.text.length < STASH_TEXT_CAP) {
-        target.text += delta.textDelta
-      }
-      // else: already truncated — drop the delta on the floor.
-    } else {
-      stashed[idx] = part
-    }
+    stashed[idx] = part
   }
 
   function handlePartRemoved(sessionID: string | undefined, messageID: string, partID: string) {
     if (sessionID) patchPage(sessionID, { lastMutation: "update" })
+
+    // Drop any pending text-deltas for this part — the part is gone and
+    // applying queued deltas would be a no-op at best, a phantom-text bug
+    // if the part id is reused.
+    dropPendingDeltasFor(messageID, partID)
 
     setStore(
       "parts",
@@ -1777,10 +1886,14 @@ export const SessionProvider: ParentComponent = (props) => {
     if (cached) return cached.memo()
     const created = createRoot((dispose) => {
       const family = getFamilyMemo(sessionID)
-      const memo = createMemo(() => {
-        const fam = family()
-        return permissions().filter((p) => fam.has(p.sessionID))
-      })
+      const memo = createMemo<PermissionRequest[]>(
+        () => {
+          const fam = family()
+          return permissions().filter((p) => fam.has(p.sessionID))
+        },
+        [],
+        { equals: arraysShallowEqual },
+      )
       return { memo, dispose }
     })
     scopedPermsMemos.set(sessionID, created)
@@ -1794,10 +1907,14 @@ export const SessionProvider: ParentComponent = (props) => {
     if (cached) return cached.memo()
     const created = createRoot((dispose) => {
       const family = getFamilyMemo(sessionID)
-      const memo = createMemo(() => {
-        const fam = family()
-        return questions().filter((q) => fam.has(q.sessionID))
-      })
+      const memo = createMemo<QuestionRequest[]>(
+        () => {
+          const fam = family()
+          return questions().filter((q) => fam.has(q.sessionID))
+        },
+        [],
+        { equals: arraysShallowEqual },
+      )
       return { memo, dispose }
     })
     scopedQuestionsMemos.set(sessionID, created)
@@ -1810,10 +1927,14 @@ export const SessionProvider: ParentComponent = (props) => {
     if (cached) return cached.memo()
     const created = createRoot((dispose) => {
       const family = getFamilyMemo(sessionID)
-      const memo = createMemo(() => {
-        const fam = family()
-        return suggestions().filter((item) => fam.has(item.sessionID))
-      })
+      const memo = createMemo<SuggestionRequest[]>(
+        () => {
+          const fam = family()
+          return suggestions().filter((item) => fam.has(item.sessionID))
+        },
+        [],
+        { equals: arraysShallowEqual },
+      )
       return { memo, dispose }
     })
     scopedSuggestionsMemos.set(sessionID, created)
@@ -1855,6 +1976,10 @@ export const SessionProvider: ParentComponent = (props) => {
       const msgs = store.messages[sessionID] ?? []
       const msgIds = msgs.map((m) => m.id)
       for (const id of msgIds) stash.remove(id)
+      // Drop pending text-deltas keyed under any of this session's messages
+      // so they don't leak across re-creation of an id (extremely rare but
+      // possible when a deleted session's id is reused).
+      for (const id of msgIds) dropPendingDeltasForMessage(id)
       clearHiddenErrors(msgIds)
       // Free per-session reactive subscriptions for family/scoped derivations.
       disposeFamilyMemosFor(sessionID)
@@ -1982,6 +2107,9 @@ export const SessionProvider: ParentComponent = (props) => {
   function handleMessageRemoved(sessionID: string, messageID: string) {
     setStore("messages", sessionID, (msgs = []) => msgs.filter((m) => m.id !== messageID))
     clearHiddenErrors([messageID])
+    // Drop any queued text-deltas for this message — applying them post-removal
+    // would either no-op or, worse, resurrect stale text on a recycled id.
+    dropPendingDeltasForMessage(messageID)
     setStore(
       "parts",
       produce((parts) => {
@@ -2597,7 +2725,9 @@ export const SessionProvider: ParentComponent = (props) => {
 
   const allStatusMap = () => statusMap as Record<string, SessionStatusInfo>
 
-  const userMessages = createMemo(() => messages().filter((m) => m.role === "user"))
+  const userMessages = createMemo<Message[]>(() => messages().filter((m) => m.role === "user"), [], {
+    equals: arraysShallowEqual,
+  })
 
   const revert = createMemo(() => {
     const id = currentSessionID()

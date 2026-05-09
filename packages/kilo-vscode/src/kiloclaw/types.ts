@@ -12,7 +12,7 @@
 
 // ── Instance status (KiloClaw worker) ───────────────────────────────
 
-export type ClawStatus = {
+export interface ClawStatus {
   // `recovering` and `restoring` are transitional states the worker reports
   // while bringing an instance back from an unexpected stop or a snapshot
   // restore (cloud: `services/kiloclaw/src/index.ts`).
@@ -40,7 +40,7 @@ export type ClawStatus = {
 
 // ── Kilo Chat token envelope (gateway response) ─────────────────────
 
-export type ChatToken = {
+export interface ChatToken {
   token: string
   expiresAt: string // ISO timestamp
   kiloChatUrl: string
@@ -52,15 +52,18 @@ export type ChatToken = {
 
 export type ExecApprovalDecision = "allow-once" | "allow-always" | "deny"
 
-export type TextBlock = { type: "text"; text: string }
+export interface TextBlock {
+  type: "text"
+  text: string
+}
 
-export type ActionItem = {
+export interface ActionItem {
   label: string
   style: "primary" | "danger" | "secondary"
   value: ExecApprovalDecision
 }
 
-export type ActionsBlock = {
+export interface ActionsBlock {
   type: "actions"
   groupId: string
   actions: ActionItem[]
@@ -75,7 +78,7 @@ export type ContentBlock = TextBlock | ActionsBlock
 
 // ── Kilo Chat reactions ─────────────────────────────────────────────
 
-export type ReactionSummary = {
+export interface ReactionSummary {
   emoji: string
   count: number
   memberIds: string[]
@@ -83,7 +86,7 @@ export type ReactionSummary = {
 
 // ── Kilo Chat message ───────────────────────────────────────────────
 
-export type Message = {
+export interface Message {
   id: string
   senderId: string
   content: ContentBlock[]
@@ -97,7 +100,7 @@ export type Message = {
 
 // ── Conversations ───────────────────────────────────────────────────
 
-export type ConversationListItem = {
+export interface ConversationListItem {
   conversationId: string
   title: string | null
   lastActivityAt: number | null
@@ -105,9 +108,12 @@ export type ConversationListItem = {
   joinedAt: number
 }
 
-export type ConversationMember = { id: string; kind: "user" | "bot" }
+export interface ConversationMember {
+  id: string
+  kind: "user" | "bot"
+}
 
-export type ConversationDetail = {
+export interface ConversationDetail {
   id: string
   title: string | null
   createdBy: string
@@ -117,13 +123,13 @@ export type ConversationDetail = {
 
 // ── Bot / conversation status (telemetry) ───────────────────────────
 
-export type BotStatusRecord = {
+export interface BotStatusRecord {
   online: boolean
   at: number
   updatedAt: number
 }
 
-export type ConversationStatusRecord = {
+export interface ConversationStatusRecord {
   conversationId: string
   contextTokens: number
   contextWindow: number
@@ -141,14 +147,14 @@ export type ConversationStatusRecord = {
  * `message.created` so clients can render a reply preview without a follow-up
  * fetch. `deleted` mirrors the soft-deletion state at the time of replying.
  */
-export type ReplyToSnapshot = {
+export interface ReplyToSnapshot {
   messageId: string
   senderId: string
   content: ContentBlock[]
   deleted?: boolean
 }
 
-export type MessageCreatedEvent = {
+export interface MessageCreatedEvent {
   messageId: string
   senderId: string
   content: ContentBlock[]
@@ -157,50 +163,93 @@ export type MessageCreatedEvent = {
   replyTo?: ReplyToSnapshot | null
 }
 
-export type MessageUpdatedEvent = {
+export interface MessageUpdatedEvent {
   messageId: string
   content: ContentBlock[]
   clientUpdatedAt: number | null
 }
 
-export type MessageDeletedEvent = { messageId: string }
-export type MessageDeliveryFailedEvent = { messageId: string }
+export interface MessageDeletedEvent {
+  messageId: string
+}
 
-export type TypingEvent = { memberId: string }
-export type TypingStopEvent = { memberId: string }
+export interface MessageDeliveryFailedEvent {
+  messageId: string
+}
 
-export type ReactionAddedEvent = { messageId: string; memberId: string; emoji: string; operationId?: string }
-export type ReactionRemovedEvent = { messageId: string; memberId: string; emoji: string; operationId?: string }
+export interface TypingEvent {
+  memberId: string
+}
+
+export interface TypingStopEvent {
+  memberId: string
+}
+
+export interface ReactionAddedEvent {
+  messageId: string
+  memberId: string
+  emoji: string
+  operationId?: string
+}
+
+export interface ReactionRemovedEvent {
+  messageId: string
+  memberId: string
+  emoji: string
+  operationId?: string
+}
 
 /**
  * Server fans out the full conversation snapshot on `conversation.created` so
  * clients can append to their list without a follow-up fetch. Older servers may
  * still send only the `conversationId`, so the snapshot is optional.
  */
-export type ConversationCreatedEvent = {
+export interface ConversationCreatedEvent {
   conversationId: string
   conversation?: ConversationListItem
 }
-export type ConversationRenamedEvent = { conversationId: string; title: string }
-export type ConversationLeftEvent = { conversationId: string }
-export type ConversationReadEvent = { conversationId: string; memberId: string; lastReadAt: number }
-export type ConversationActivityEvent = { conversationId: string; lastActivityAt: number }
 
-export type ActionExecutedEvent = {
+export interface ConversationRenamedEvent {
+  conversationId: string
+  title: string
+}
+
+export interface ConversationLeftEvent {
+  conversationId: string
+}
+
+export interface ConversationReadEvent {
+  conversationId: string
+  memberId: string
+  lastReadAt: number
+}
+
+export interface ConversationActivityEvent {
+  conversationId: string
+  lastActivityAt: number
+}
+
+export interface ActionExecutedEvent {
   conversationId: string
   messageId: string
   groupId: string
   value: ExecApprovalDecision
   executedBy: string
 }
-export type ActionDeliveryFailedEvent = {
+
+export interface ActionDeliveryFailedEvent {
   conversationId: string
   messageId: string
   groupId: string
 }
 
-export type BotStatusEvent = { sandboxId: string; online: boolean; at: number }
-export type ConversationStatusEvent = {
+export interface BotStatusEvent {
+  sandboxId: string
+  online: boolean
+  at: number
+}
+
+export interface ConversationStatusEvent {
   conversationId: string
   contextTokens: number
   contextWindow: number
@@ -209,7 +258,7 @@ export type ConversationStatusEvent = {
   at: number
 }
 
-export type KiloChatEventMap = {
+export interface KiloChatEventMap {
   "message.created": MessageCreatedEvent
   "message.updated": MessageUpdatedEvent
   "message.deleted": MessageDeletedEvent
@@ -233,7 +282,10 @@ export type KiloChatEventName = keyof KiloChatEventMap
 
 // ── Webview ↔ extension state ───────────────────────────────────────
 
-export type TypingMember = { memberId: string; at: number }
+export interface TypingMember {
+  memberId: string
+  at: number
+}
 
 // Full state snapshot pushed to the webview
 // Every phase carries `locale` so the webview can resolve translations immediately.

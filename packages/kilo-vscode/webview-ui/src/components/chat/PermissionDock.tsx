@@ -29,6 +29,40 @@ let rulesExpandedPreference = false
 const RULE_VIRTUAL_THRESHOLD = 50
 const RULE_ESTIMATE_SIZE = 28
 
+interface PermissionRuleVirtualRowProps {
+  rule: string
+  index: number
+  start: number
+  measureElement: (el: HTMLElement | null) => void
+  renderRule: (rule: string, index: number) => unknown
+}
+
+/**
+ * Per-rule virtualized row wrapper. Extracting this from inline JSX inside
+ * the <For each={virtualRuleItems}> callback isolates each row's reactive
+ * owner — descendants dispose with the row when the virtualizer recycles
+ * or unmounts it. Inline rendering attaches descendants to the parent dock
+ * owner and lets them accumulate across scroll.
+ */
+const PermissionRuleVirtualRow: Component<PermissionRuleVirtualRowProps> = (props) => {
+  return (
+    <div
+      ref={(el) => props.measureElement(el)}
+      data-index={props.index}
+      data-slot="permission-rule-virtual-row"
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        transform: `translateY(${props.start}px)`,
+      }}
+    >
+      {props.renderRule(props.rule, props.index) as unknown as Element}
+    </div>
+  )
+}
+
 export const PermissionDock: Component<{
   request: PermissionRequest
   responding: boolean
@@ -292,26 +326,16 @@ export const PermissionDock: Component<{
                       >
                         <For each={virtualRuleItems()}>
                           {(item) => {
-                            const rule = createMemo(() => rules()[item.index])
+                            const rule = rules()[item.index]
+                            if (rule === undefined) return null
                             return (
-                              <Show when={rule()}>
-                                {(value) => (
-                                  <div
-                                    ref={(el) => ruleVirtualizer.measureElement(el)}
-                                    data-index={item.index}
-                                    data-slot="permission-rule-virtual-row"
-                                    style={{
-                                      position: "absolute",
-                                      top: 0,
-                                      left: 0,
-                                      width: "100%",
-                                      transform: `translateY(${item.start}px)`,
-                                    }}
-                                  >
-                                    {renderRule(value(), item.index)}
-                                  </div>
-                                )}
-                              </Show>
+                              <PermissionRuleVirtualRow
+                                rule={rule}
+                                index={item.index}
+                                start={item.start}
+                                measureElement={(el) => el && ruleVirtualizer.measureElement(el)}
+                                renderRule={renderRule}
+                              />
                             )
                           }}
                         </For>

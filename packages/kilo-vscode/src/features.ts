@@ -2,12 +2,12 @@ import { hasIndexingPlugin } from "@kilocode/kilo-indexing/detect"
 
 type PluginSpec = string | [string, Record<string, unknown>]
 
-type ConfigLike = {
+interface ConfigLike {
   plugin?: readonly PluginSpec[] | null
   experimental?: { semantic_indexing?: boolean } | null
 }
 
-export type Features = {
+export interface Features {
   indexing: boolean
 }
 

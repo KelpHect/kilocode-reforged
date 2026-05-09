@@ -4,7 +4,7 @@ const IMAGE_PREVIEW_ID = "imagePreview.previewEditor"
 const PREVIEW_DIR = "image-preview"
 const PREVIEW_LIMIT = 20
 
-type Preview = {
+interface Preview {
   data: Uint8Array
   ext: string
   name: string

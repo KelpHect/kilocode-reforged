@@ -1,10 +1,12 @@
-type Meta = { sessionId?: string }
+interface Meta {
+  sessionId?: string
+}
 
-type State = {
+interface State {
   metadata?: Meta
 }
 
-type Part = {
+interface Part {
   type?: string
   tool?: string
   metadata?: Meta

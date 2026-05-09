@@ -7,7 +7,19 @@
  * Active questions render inline via QuestionDock; permissions are in the bottom dock.
  */
 
-import { Component, For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js"
+import {
+  Component,
+  For,
+  Match,
+  Show,
+  Switch,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  onMount,
+} from "solid-js"
 import { Dynamic } from "solid-js/web"
 import { createVirtualizer } from "@tanstack/solid-virtual"
 import { Part, PART_MAPPING, ToolRegistry } from "@kilocode/kilo-ui/message-part"
@@ -30,8 +42,7 @@ const LARGE_PART_THRESHOLD = 12
 const ASSISTANT_PART_ESTIMATE = 80
 const ASSISTANT_PART_OVERSCAN = 3
 
-const isFirefox =
-  typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("firefox")
+const isFirefox = typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("firefox")
 
 // Tools that the upstream message-part renderer suppresses (returns null for).
 // We render these ourselves via ToolRegistry when they complete,
@@ -61,15 +72,14 @@ function isRenderable(part: SDKPart): boolean {
  * 80 parts × 4 questions that's 640 .find() walks per question keystroke.
  * Building the map once per dock change makes per-part lookup O(1).
  */
+type ToolRequest<T = unknown> = { tool?: { callID: string; messageID: string } } & T
+
 function buildToolRequestIndex<T extends { tool?: { callID: string; messageID: string } }>(
   name: string,
   requests: T[],
 ): Map<string, T> {
   const m = new Map<string, T>()
   for (const r of requests) {
-    if (r.tool && (r as unknown as { tool: { tool: string } }).tool?.tool !== undefined) {
-      // request shape: { tool: { tool: name, callID, messageID, ... } } — strict-typed at the call site
-    }
     if (r.tool) m.set(`${name}:${r.tool.callID}:${r.tool.messageID}`, r)
   }
   return m
@@ -89,14 +99,20 @@ interface AssistantMessageProps {
   feedback?: MessageFeedbackControls
 }
 
+// SAFETY: ToolRegistry.render returns a Component<unknown> that varies by tool;
+// Dynamic dispatches at runtime by tool name. Local `any` typing here mirrors
+// the upstream message-part renderer's type contract — narrowing further would
+// require a discriminated union per tool name.
+type ToolState = { input?: unknown; metadata?: unknown; output?: unknown; status?: string }
+
 function TodoToolCard(props: { part: ToolPart }) {
   const render = ToolRegistry.render(props.part.tool)
-  const state = props.part.state as any
+  const state = props.part.state as ToolState
   return (
     <Show when={render}>
       {(renderFn) => (
         <Dynamic
-          component={renderFn()}
+          component={renderFn() as unknown as Component<Record<string, unknown>>}
           input={state?.input ?? {}}
           metadata={state?.metadata ?? {}}
           tool={props.part.tool}
@@ -112,7 +128,7 @@ function TodoToolCard(props: { part: ToolPart }) {
 
 function BashToolCard(props: { part: ToolPart; defaultOpen: boolean }) {
   const render = ToolRegistry.render(props.part.tool)
-  const state = props.part.state as any
+  const state = props.part.state as ToolState
   return (
     <Show when={render}>
       {(card) => (
@@ -132,6 +148,128 @@ function BashToolCard(props: { part: ToolPart; defaultOpen: boolean }) {
         />
       )}
     </Show>
+  )
+}
+
+type PartKind =
+  | { kind: "question"; req: ToolRequest }
+  | { kind: "suggest"; req: ToolRequest }
+  | { kind: "bash" }
+  | { kind: "todo" }
+  | { kind: "default" }
+  | { kind: "skip" }
+
+interface PartRowProps {
+  part: SDKPart
+  message: SDKAssistantMessage
+  showAssistantCopyPartID?: string | null
+  feedback?: MessageFeedbackControls
+  questionIndex: Map<string, ToolRequest>
+  suggestionIndex: Map<string, ToolRequest>
+  open: boolean
+  reasoningAutoCollapse: boolean
+}
+
+/**
+ * Per-part row component. Extracting this from inline JSX inside the
+ * <For each={virtualItems}> callback gives each row its own owner — the
+ * `classify` memo and any descendant effects dispose with the row when the
+ * virtualizer recycles or unmounts it. Inline rendering would attach those
+ * memos to the parent's owner and let them accumulate across scroll.
+ */
+const PartRow: Component<PartRowProps> = (props) => {
+  const classify = createMemo<PartKind>(() => {
+    const part = props.part
+    const isUpstreamSuppressed =
+      part.type === "tool" && UPSTREAM_SUPPRESSED_TOOLS.has((part as SDKPart & { tool: string }).tool)
+    if (part.type === "tool") {
+      const tp = part as unknown as ToolPart
+      const q = lookupToolRequest(part, "question", props.questionIndex)
+      if (q) return { kind: "question", req: q as ToolRequest }
+      const s = lookupToolRequest(part, "suggest", props.suggestionIndex)
+      if (s) return { kind: "suggest", req: s as ToolRequest }
+      if (tp.tool === "bash" && tp.state?.status !== "error") return { kind: "bash" }
+      if (isUpstreamSuppressed) return { kind: "todo" }
+    }
+    return PART_MAPPING[part.type] ? { kind: "default" } : { kind: "skip" }
+  })
+
+  return (
+    <Show when={classify().kind !== "skip"}>
+      <div data-component="tool-part-wrapper" data-part-type={props.part.type}>
+        <Switch>
+          <Match when={classify().kind === "question" && (classify() as { req: unknown }).req}>
+            {(req) => <QuestionDock request={req() as never} />}
+          </Match>
+          <Match when={classify().kind === "suggest" && (classify() as { req: unknown }).req}>
+            {(req) => <SuggestBar request={req() as never} />}
+          </Match>
+          <Match when={classify().kind === "bash"}>
+            <BashToolCard part={props.part as unknown as ToolPart} defaultOpen={props.open} />
+          </Match>
+          <Match when={classify().kind === "todo"}>
+            <TodoToolCard part={props.part as unknown as ToolPart} />
+          </Match>
+          <Match when={classify().kind === "default"}>
+            <Part
+              part={props.part}
+              message={props.message as SDKMessage}
+              showAssistantCopyPartID={props.showAssistantCopyPartID}
+              reasoningAutoCollapse={props.reasoningAutoCollapse}
+              feedback={props.feedback}
+              animate={
+                props.part.type === "tool" &&
+                ((props.part as unknown as ToolPart).state?.status === "pending" ||
+                  (props.part as unknown as ToolPart).state?.status === "running")
+              }
+            />
+          </Match>
+        </Switch>
+      </div>
+    </Show>
+  )
+}
+
+interface VirtualPartRowProps extends PartRowProps {
+  index: number
+  start: number
+  scrollMargin: number
+  measureElement: (el: HTMLElement | null) => void
+}
+
+/**
+ * Virtualized variant of PartRow — wraps PartRow in the absolutely-positioned
+ * container the virtualizer expects and registers measureElement.
+ *
+ * Using a component (vs. inline JSX in the virtualizer's render callback)
+ * isolates the row's reactive owner. Per-row memos and effects dispose
+ * when the row unmounts, preventing accumulation across scroll.
+ */
+const VirtualPartRow: Component<VirtualPartRowProps> = (props) => {
+  return (
+    <div
+      ref={(el) => props.measureElement(el)}
+      data-index={props.index}
+      data-slot="assistant-part-virtual-row"
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        transform: `translateY(${props.start - props.scrollMargin}px)`,
+      }}
+    >
+      <PartRow
+        part={props.part}
+        message={props.message}
+        showAssistantCopyPartID={props.showAssistantCopyPartID}
+        feedback={props.feedback}
+        questionIndex={props.questionIndex}
+        suggestionIndex={props.suggestionIndex}
+        open={props.open}
+        reasoningAutoCollapse={props.reasoningAutoCollapse}
+      />
+    </div>
   )
 }
 
@@ -202,79 +340,33 @@ export const AssistantMessage: Component<AssistantMessageProps> = (props) => {
   // and did an O(Q) .find() — for an 80-part assistant message with a
   // 4-question dock that was 640 scans per question keystroke. Now: build
   // index once when the dock changes, O(1) lookup per part.
-  const questionIndex = createMemo(() => buildToolRequestIndex("question", session.questions()))
-  const suggestionIndex = createMemo(() => buildToolRequestIndex("suggest", session.suggestions()))
-
-  const renderPart = (part: SDKPart) => {
-    // Upstream PART_MAPPING["tool"] returns null for todowrite/todoread,
-    // so we detect them here and render via ToolRegistry directly.
-    const isUpstreamSuppressed =
-      part.type === "tool" && UPSTREAM_SUPPRESSED_TOOLS.has((part as SDKPart & { tool: string }).tool)
-
-    // Single classifier — replaces a 5-deep <Show> cascade where every
-    // fallback re-evaluated the predicates above it. Switch/Match runs
-    // exactly the matching branch and skips the rest.
-    type PartKind =
-      | { kind: "question"; req: NonNullable<ReturnType<typeof lookupToolRequest>> }
-      | { kind: "suggest"; req: NonNullable<ReturnType<typeof lookupToolRequest>> }
-      | { kind: "bash" }
-      | { kind: "todo" }
-      | { kind: "default" }
-      | { kind: "skip" }
-    const classify = createMemo<PartKind>(() => {
-      if (part.type === "tool") {
-        const tp = part as unknown as ToolPart
-        const q = lookupToolRequest(part, "question", questionIndex())
-        if (q) return { kind: "question", req: q }
-        const s = lookupToolRequest(part, "suggest", suggestionIndex())
-        if (s) return { kind: "suggest", req: s }
-        if (tp.tool === "bash" && tp.state?.status !== "error") return { kind: "bash" }
-        if (isUpstreamSuppressed) return { kind: "todo" }
-      }
-      return PART_MAPPING[part.type] ? { kind: "default" } : { kind: "skip" }
-    })
-
-    return (
-      <Show when={classify().kind !== "skip"}>
-        <div data-component="tool-part-wrapper" data-part-type={part.type}>
-          <Switch>
-            <Match when={classify().kind === "question" && (classify() as { req: unknown }).req}>
-              {(req) => <QuestionDock request={req() as never} />}
-            </Match>
-            <Match when={classify().kind === "suggest" && (classify() as { req: unknown }).req}>
-              {(req) => <SuggestBar request={req() as never} />}
-            </Match>
-            <Match when={classify().kind === "bash"}>
-              <BashToolCard part={part as unknown as ToolPart} defaultOpen={open()} />
-            </Match>
-            <Match when={classify().kind === "todo"}>
-              <TodoToolCard part={part as unknown as ToolPart} />
-            </Match>
-            <Match when={classify().kind === "default"}>
-              <Part
-                part={part}
-                message={props.message as SDKMessage}
-                showAssistantCopyPartID={props.showAssistantCopyPartID}
-                reasoningAutoCollapse={display.reasoningAutoCollapse()}
-                feedback={props.feedback}
-                animate={
-                  part.type === "tool" &&
-                  ((part as unknown as ToolPart).state?.status === "pending" ||
-                    (part as unknown as ToolPart).state?.status === "running")
-                }
-              />
-            </Match>
-          </Switch>
-        </div>
-      </Show>
-    )
-  }
+  const questionIndex = createMemo<Map<string, ToolRequest>>(
+    () => buildToolRequestIndex("question", session.questions()) as Map<string, ToolRequest>,
+  )
+  const suggestionIndex = createMemo<Map<string, ToolRequest>>(
+    () => buildToolRequestIndex("suggest", session.suggestions()) as Map<string, ToolRequest>,
+  )
 
   return (
     <div ref={setRoot} data-component="assistant-message-parts" data-virtualized={large() ? "" : undefined}>
       <Show
         when={large()}
-        fallback={<For each={parts()}>{(part) => renderPart(part)}</For>}
+        fallback={
+          <For each={parts()}>
+            {(part) => (
+              <PartRow
+                part={part}
+                message={props.message}
+                showAssistantCopyPartID={props.showAssistantCopyPartID}
+                feedback={props.feedback}
+                questionIndex={questionIndex()}
+                suggestionIndex={suggestionIndex()}
+                open={open()}
+                reasoningAutoCollapse={display.reasoningAutoCollapse()}
+              />
+            )}
+          </For>
+        }
       >
         <div
           data-slot="assistant-parts-virtual"
@@ -286,26 +378,23 @@ export const AssistantMessage: Component<AssistantMessageProps> = (props) => {
         >
           <For each={virtualItems()}>
             {(item) => {
-              const part = createMemo(() => parts()[item.index])
+              const part = parts()[item.index]
+              if (!part) return null
               return (
-                <Show when={part()}>
-                  {(p) => (
-                    <div
-                      ref={(el) => virtualizer.measureElement(el)}
-                      data-index={item.index}
-                      data-slot="assistant-part-virtual-row"
-                      style={{
-                        position: "absolute",
-                        top: 0,
-                        left: 0,
-                        width: "100%",
-                        transform: `translateY(${item.start - scrollMargin()}px)`,
-                      }}
-                    >
-                      {renderPart(p())}
-                    </div>
-                  )}
-                </Show>
+                <VirtualPartRow
+                  part={part}
+                  message={props.message}
+                  showAssistantCopyPartID={props.showAssistantCopyPartID}
+                  feedback={props.feedback}
+                  questionIndex={questionIndex()}
+                  suggestionIndex={suggestionIndex()}
+                  open={open()}
+                  reasoningAutoCollapse={display.reasoningAutoCollapse()}
+                  index={item.index}
+                  start={item.start}
+                  scrollMargin={scrollMargin()}
+                  measureElement={(el) => el && virtualizer.measureElement(el)}
+                />
               )
             }}
           </For>

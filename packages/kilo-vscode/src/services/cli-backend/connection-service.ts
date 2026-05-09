@@ -4,6 +4,15 @@ import { createKiloClient, type KiloClient, type Event } from "@kilocode/sdk/v2/
 import { SdkSSEAdapter } from "./sdk-sse-adapter"
 import type { ServerConfig } from "./types"
 import { resolveEventSessionId as resolveEventSessionIdPure } from "./connection-utils"
+import { BoundedMap } from "../../util/bounded-map"
+
+/**
+ * Cap on the message → session ID resolution cache. Sized for ~100 sessions ×
+ * 500 messages each, plus headroom. Hitting this cap means a session-delete
+ * path missed pruneSession — we evict oldest and log a one-time warning so the
+ * regression is visible rather than silently growing into an 8-hour leak.
+ */
+const MESSAGE_SESSION_MAP_CAP = 50_000
 
 export type ConnectionState = "connecting" | "connected" | "disconnected" | "error"
 type SSEEventListener = (event: Event, directory?: string) => void
@@ -82,8 +91,22 @@ export class KiloConnectionService {
   /**
    * Shared mapping used to resolve session scope for events that don't reliably include a sessionID.
    * Used primarily for message.part.updated where only messageID may be present.
+   *
+   * Bounded to MESSAGE_SESSION_MAP_CAP entries: when a message evicts due to overflow,
+   * the inverse index `messagesBySessionId` is updated in lockstep via the eviction hook.
    */
-  private readonly messageSessionIdsByMessageId: Map<string, string> = new Map()
+  private readonly messageSessionIdsByMessageId: BoundedMap<string, string> = (() => {
+    const map = new BoundedMap<string, string>({
+      cap: MESSAGE_SESSION_MAP_CAP,
+      name: "messageSessionIdsByMessageId",
+    })
+    map.onEvict((messageId, sessionId) => {
+      const set = this.messagesBySessionId.get(sessionId)
+      set?.delete(messageId)
+      if (set && set.size === 0) this.messagesBySessionId.delete(sessionId)
+    })
+    return map
+  })()
   /**
    * Inverse index — sessionId → set of messageIds that resolve to it. Maintained
    * alongside `messageSessionIdsByMessageId` so `pruneSession` is O(messages-in-deleted-session)

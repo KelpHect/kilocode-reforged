@@ -86,6 +86,7 @@ import HistoryView from "../src/components/history/HistoryView"
 import { NewWorktreeDialog } from "./NewWorktreeDialog"
 import { LanguageBridge, DataBridge, MermaidDownloadBridge } from "../src/App"
 import { useLanguage } from "../src/context/language"
+import { setsEqual } from "../src/context/session-utils"
 import { formatRelativeDate } from "../src/utils/date"
 import { nextSelectionAfterDelete, adjacentHint, restoreLocalSessions, reconcileLocalSessions, LOCAL } from "./navigate"
 import { reorderTabs, applyTabOrder, firstOrderedTitle } from "./tab-order"
@@ -425,7 +426,9 @@ const AgentManagerContent: Component = () => {
     return state.status === "checking" || state.status === "applying"
   })
 
-  const applySelectedSet = createMemo(() => new Set(applySelectedFiles()))
+  const applySelectedSet = createMemo<Set<string>>(() => new Set(applySelectedFiles()), new Set<string>(), {
+    equals: setsEqual,
+  })
 
   const applySelectionStats = createMemo(() => {
     const set = applySelectedSet()
@@ -704,16 +707,20 @@ const AgentManagerContent: Component = () => {
     if (target && !ids.has(target)) closeApplyDialog()
   })
 
-  const worktreeSessionIds = createMemo(
+  const worktreeSessionIds = createMemo<Set<string>>(
     () =>
       new Set(
         managedSessions()
           .filter((ms) => ms.worktreeId)
           .map((ms) => ms.id),
       ),
+    new Set<string>(),
+    { equals: setsEqual },
   )
 
-  const localSet = createMemo(() => new Set(localSessionIDs()))
+  const localSet = createMemo<Set<string>>(() => new Set(localSessionIDs()), new Set<string>(), {
+    equals: setsEqual,
+  })
 
   // Sessions NOT in any worktree and not local
   const unassignedSessions = createMemo(() =>

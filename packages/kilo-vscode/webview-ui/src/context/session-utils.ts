@@ -2,7 +2,32 @@ import type { Part } from "../types/messages"
 
 export const SNAPSHOT_PROGRESS_TEXT = "Initializing snapshot..."
 
-type SnapshotPart = {
+/**
+ * Reference-equal length-checked array comparison. Use as the `equals`
+ * comparator for `createMemo` derivations that return freshly-allocated
+ * arrays (e.g. `arr.filter(...)`) over a stable underlying source — without
+ * it, default `===` always reports change and propagates a re-run to every
+ * downstream consumer on every upstream tick.
+ */
+export function arraysShallowEqual<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+/**
+ * Content-equal Set comparison. Same rationale as `arraysShallowEqual` but
+ * for memos returning a freshly-allocated `Set<T>`.
+ */
+export function setsEqual<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {
+  if (a === b) return true
+  if (a.size !== b.size) return false
+  for (const v of a) if (!b.has(v)) return false
+  return true
+}
+
+interface SnapshotPart {
   type?: string
   text?: string
   synthetic?: boolean
@@ -15,15 +40,19 @@ export function snapshotProgress(part: SnapshotPart | undefined): boolean {
 }
 
 /** Minimal message shape for cost breakdown helpers. */
-export type CostMessage = { id: string; role: string; cost?: number }
+export interface CostMessage {
+  id: string
+  role: string
+  cost?: number
+}
 
 /** Minimal tool part shape for label extraction. */
-type ToolState = {
+interface ToolState {
   input?: { description?: string; subagent_type?: string }
   metadata?: { sessionId?: string }
 }
 
-type TaskPart = {
+interface TaskPart {
   type: string
   tool?: string
   metadata?: { sessionId?: string }

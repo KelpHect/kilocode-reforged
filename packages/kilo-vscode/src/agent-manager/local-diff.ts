@@ -5,7 +5,7 @@ import type { WorktreeDiffEntry } from "./types"
 
 type Status = "added" | "deleted" | "modified"
 
-type Meta = {
+interface Meta {
   file: string
   additions: number
   deletions: number

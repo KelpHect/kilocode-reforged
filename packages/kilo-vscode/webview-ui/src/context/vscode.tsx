@@ -54,14 +54,38 @@ export const VSCodeProvider: ParentComponent = (props) => {
   const wildcards = new Set<(message: ExtensionMessage) => void>()
   const byType = new Map<string, Set<(message: ExtensionMessage) => void>>()
 
-  // Listen for messages from the extension
-  const messageListener = (event: MessageEvent) => {
-    const message = event.data as ExtensionMessage
+  /**
+   * Dispatch a single ExtensionMessage to byType + wildcard subscribers.
+   * Hoisted from the listener so the batch-envelope path can re-enter it
+   * without rebuilding the dispatch logic.
+   */
+  const dispatch = (message: ExtensionMessage) => {
     if (message && typeof message === "object" && "type" in message) {
       const set = byType.get((message as { type: string }).type)
       if (set) for (const h of set) h(message)
     }
     for (const h of wildcards) h(message)
+  }
+
+  // Listen for messages from the extension
+  const messageListener = (event: MessageEvent) => {
+    const message = event.data as ExtensionMessage
+    // Batch envelope produced by the extension-side microtask-coalesced
+    // postMessage. Flatten it once here so every downstream handler sees
+    // individual events as if they had arrived separately.
+    if (
+      message &&
+      typeof message === "object" &&
+      "type" in message &&
+      (message as { type: string }).type === "extensionBatch"
+    ) {
+      const events = (message as { events?: unknown }).events
+      if (Array.isArray(events)) {
+        for (let i = 0; i < events.length; i++) dispatch(events[i] as ExtensionMessage)
+      }
+      return
+    }
+    dispatch(message)
   }
 
   window.addEventListener("message", messageListener)

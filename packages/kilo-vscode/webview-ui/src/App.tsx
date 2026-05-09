@@ -1,4 +1,15 @@
-import { Component, createSignal, createMemo, Switch, Match, Show, onMount, onCleanup } from "solid-js"
+import {
+  Component,
+  ParentComponent,
+  createSignal,
+  createMemo,
+  Switch,
+  Match,
+  Show,
+  onMount,
+  onCleanup,
+} from "solid-js"
+import type { PermissionRequest } from "./types/messages"
 import { ThemeProvider } from "@kilocode/kilo-ui/theme"
 import { DialogProvider } from "@kilocode/kilo-ui/context/dialog"
 import { MarkedProvider } from "@kilocode/kilo-ui/context/marked"
@@ -35,7 +46,14 @@ import { MigrationWizard } from "./components/migration" // legacy-migration
 import { NotificationsProvider } from "./context/notifications"
 import { FeedbackProvider } from "./context/feedback"
 import { KiloEmbeddingModelsProvider } from "./context/kilo-embedding-models"
-import type { Message as SDKMessage, Part as SDKPart } from "@kilocode/sdk/v2"
+import type {
+  Message as SDKMessage,
+  Part as SDKPart,
+  Session as SDKSession,
+  SessionStatus as SDKSessionStatus,
+  Provider as SDKProvider,
+  ProviderListResponse as SDKProviderListResponse,
+} from "@kilocode/sdk/v2"
 import "./styles/chat.css"
 
 type ViewType = "newTask" | "marketplace" | "history" | "profile" | "settings" | "subAgentViewer"
@@ -58,7 +76,7 @@ const VALID_VIEWS = new Set<string>(["newTask", "marketplace", "history", "profi
  * that specific key. A text-delta on message Y only invalidates consumers
  * that actually read `part[Y]`, not the whole tree.
  */
-export const DataBridge: Component<{ children: any }> = (props) => {
+export const DataBridge: ParentComponent = (props) => {
   const session = useSession()
   const vscode = useVSCode()
   const prov = useProvider()
@@ -66,12 +84,17 @@ export const DataBridge: Component<{ children: any }> = (props) => {
 
   // Memos for fields that change infrequently (not per-token) — cheap and
   // avoids allocating a fresh array/object on every consumer read.
-  const sessionList = createMemo(
-    () => session.sessions().map((s) => ({ ...s, id: s.id, role: "user" as const })) as unknown as any[],
+  //
+  // The local SessionInfo / Provider types are subsets of the SDK Session /
+  // Provider types that kilo-ui's DataProvider expects. Casts at the bridge
+  // boundary widen them to the SDK shape that downstream consumers (kilo-ui
+  // message-part renderer) read by structural property access only.
+  const sessionList = createMemo<SDKSession[]>(
+    () => session.sessions().map((s) => ({ ...s, id: s.id, role: "user" as const })) as unknown as SDKSession[],
   )
 
-  const permissionsBySession = createMemo(() => {
-    const grouped: Record<string, any[]> = {}
+  const permissionsBySession = createMemo<Record<string, PermissionRequest[]>>(() => {
+    const grouped: Record<string, PermissionRequest[]> = {}
     for (const p of session.permissions()) {
       const sid = p.sessionID
       if (!sid) continue
@@ -80,8 +103,8 @@ export const DataBridge: Component<{ children: any }> = (props) => {
     return grouped
   })
 
-  const providerData = createMemo(() => ({
-    all: Object.values(prov.providers()) as unknown as any[],
+  const providerData = createMemo<SDKProviderListResponse>(() => ({
+    all: Object.values(prov.providers()) as unknown as SDKProvider[],
     connected: prov.connected(),
     default: prov.defaults(),
   }))
@@ -96,10 +119,10 @@ export const DataBridge: Component<{ children: any }> = (props) => {
       return sessionList()
     },
     get session_status() {
-      return session.allStatusMap() as unknown as Record<string, any>
+      return session.allStatusMap() as unknown as Record<string, SDKSessionStatus>
     },
     get session_diff() {
-      return {} as Record<string, any[]>
+      return {} as Record<string, never[]>
     },
     get message() {
       return session.allMessages() as unknown as Record<string, SDKMessage[]>
@@ -116,7 +139,7 @@ export const DataBridge: Component<{ children: any }> = (props) => {
       return {}
     },
     get provider() {
-      return providerData() as unknown as any
+      return providerData()
     },
   }
 
@@ -171,7 +194,7 @@ export const DataBridge: Component<{ children: any }> = (props) => {
  * Wraps children in LanguageProvider, passing server-side language info.
  * Must be below ServerProvider in the hierarchy.
  */
-export const LanguageBridge: Component<{ children: any }> = (props) => {
+export const LanguageBridge: ParentComponent = (props) => {
   const server = useServer()
   return (
     <LanguageProvider vscodeLanguage={server.vscodeLanguage} languageOverride={server.languageOverride}>

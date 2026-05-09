@@ -4,7 +4,7 @@ import type { DiffSource, DiffSourceCapabilities, DiffSourceDescriptor, DiffSour
 import type { DiffFile } from "./types"
 import type { PanelContext } from "./types"
 
-type Messages = {
+interface Messages {
   available?: (descriptors: DiffSourceDescriptor[], id: string) => unknown
   capabilities?: (capabilities: DiffSourceCapabilities) => unknown
   loading?: (source: DiffSource, loading: boolean) => unknown
@@ -15,7 +15,10 @@ type Messages = {
   unsupportedRevert: (source: DiffSource | undefined, file: string) => unknown
 }
 
-type ActivateOptions = { poll?: boolean; fetch?: boolean }
+interface ActivateOptions {
+  poll?: boolean
+  fetch?: boolean
+}
 
 const viewerMessages: Messages = {
   available: (descriptors, id) => ({

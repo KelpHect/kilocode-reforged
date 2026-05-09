@@ -3,6 +3,7 @@ import * as path from "path"
 import type { KiloClient, Session } from "@kilocode/sdk/v2/client"
 import type { KiloConnectionService } from "../services/cli-backend"
 import { getErrorMessage } from "../kilo-provider-utils"
+import { PostMessageBatcher } from "../kilo-provider/post-message-batcher"
 import { resolveLocalDiffTarget } from "../diff/shared/target"
 import { getDiffMarkdownRender, setDiffMarkdownRender } from "../review-settings"
 import { isAbsolutePath } from "../path-utils"
@@ -1619,8 +1620,24 @@ export class AgentManagerProvider implements Disposable {
     this.host.openFile(resolved, line, column)
   }
 
+  /**
+   * Microtask-coalesced panel postMessage. Implementation lives in
+   * `kilo-provider/post-message-batcher.ts`. At high SSE event rates
+   * (200 evt/s) the per-message IPC syscall dominates. Webview-side
+   * `extensionBatch` dispatcher unwraps `events[]` and routes each through
+   * normal handlers.
+   */
+  private readonly panelBatcher = new PostMessageBatcher({
+    getTarget: () => this.panel,
+    name: "AgentManagerProvider",
+  })
+
   private postToWebview(message: AgentManagerOutMessage): void {
-    this.panel?.postMessage(message)
+    this.panelBatcher.enqueue(message)
+  }
+
+  private flushPanelMessages(): void {
+    this.panelBatcher.flush()
   }
 
   /**
@@ -1702,7 +1719,7 @@ export class AgentManagerProvider implements Disposable {
   }
 
   public postMessage(message: unknown): void {
-    this.panel?.postMessage(message)
+    this.panelBatcher.enqueue(message)
   }
 
   public shutdown(): Promise<void> {
@@ -1715,6 +1732,9 @@ export class AgentManagerProvider implements Disposable {
   }
 
   private async disposeAsync(): Promise<void> {
+    // Drain any panel messages still queued in the microtask coalescer so
+    // they aren't lost when the panel is disposed below.
+    this.flushPanelMessages()
     await this.stateReady?.catch((err) => this.log("dispose: stateReady rejected:", err))
     await this.state?.flush().catch((err) => this.log("dispose: state flush failed:", err))
     this.unsubTool?.()
