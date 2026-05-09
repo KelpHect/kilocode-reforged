@@ -19,6 +19,8 @@ interface Target {
 
 type AgentManagerDiffFile = DiffFile & WorktreeDiffEntry
 
+type AgentManagerDiffFile = DiffFile & WorktreeDiffEntry
+
 export interface WorktreeDiffControllerContext {
   getState: () => WorktreeStateManager | undefined
   getRoot: () => string | undefined
